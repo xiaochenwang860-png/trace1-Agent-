@@ -23,7 +23,13 @@ credentials, personal data, or exploit details in an issue.
 ## Safe use
 
 - Use a dedicated development machine or disposable ECS instance.
-- Use a scoped, revocable Ark key and a unique `APP_AUTH_TOKEN`.
+- Use a scoped, revocable Ark key and a separate `TRACE_VIEWER_TOKEN` for
+  developers. Browser accounts use salted password hashes and revocable random
+  session tokens; `APP_AUTH_TOKEN` remains only as an optional legacy fallback.
+- Do not expose the `/developer` console or Trace API to ordinary users. The
+  local POC prints an ephemeral developer token at startup; production
+  operators must configure and distribute it through an approved secret
+  channel.
 - Keep local use on loopback and restrict ECS Web and SSH CIDRs.
 - Add HTTPS before sending the shared token over an untrusted network.
 - Never mount production data or provide Volcengine account AK/SK to Agents.

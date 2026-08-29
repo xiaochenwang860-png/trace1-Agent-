@@ -148,6 +148,10 @@ fi
 export NODE_ENV=production
 export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-3000}"
+if [[ -z "${TRACE_VIEWER_TOKEN:-}" ]]; then
+  TRACE_VIEWER_TOKEN="$(node -p 'require("node:crypto").randomBytes(18).toString("base64url")')"
+  export TRACE_VIEWER_TOKEN
+fi
 export CODEX_SANDBOX_MODE="$codex_sandbox_mode"
 export RUNTIME_PROVIDER=container
 export CONTAINER_ENGINE="$engine"
@@ -173,5 +177,7 @@ cleanup
 log "Building the local Web and API."
 npm run build
 
-log "Open http://localhost:$PORT"
+log "Agent workspace: http://localhost:$PORT"
+log "Developer console: http://localhost:$PORT/developer"
+log "Developer console token: $TRACE_VIEWER_TOKEN"
 npm start

@@ -5,6 +5,7 @@ import type { AppConfig } from "./config.js";
 import { RunCancelledError } from "./errors.js";
 import type {
   AgentRunner,
+  RunnerTraceEvent,
   RunUsage,
   RunnerRequest,
   RunnerResult,
@@ -17,6 +18,60 @@ export interface ParsedEvents {
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
+  turnStartedAt: number | null;
+  itemStartedAt: Record<string, number>;
+}
+
+const toolItemTypes = new Set(["command_execution", "mcp_tool_call", "web_search"]);
+
+function traceText(value: unknown, fallback: string): string {
+  const text = typeof value === "string" && value.trim() ? value.trim() : fallback;
+  return text
+    .replace(/(bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
+    .replace(
+      /((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s"']+/gi,
+      "$1[REDACTED]",
+    )
+    .slice(0, 240);
+}
+
+function itemSummary(item: Record<string, unknown>): string {
+  if (item.type === "command_execution") {
+    const command = traceText(item.command, "unknown command");
+    const executable = command.split(/\s+/)[0] ?? "unknown command";
+    return "Command execution: " + executable;
+  }
+  if (item.type === "mcp_tool_call") {
+    const server = traceText(item.server, "MCP");
+    const tool = traceText(item.tool, "unknown tool");
+    return "MCP tool: " + server + "/" + tool;
+  }
+  if (item.type === "web_search") {
+    return "Web search: " + traceText(item.query, "query not reported");
+  }
+  return "Agent tool operation";
+}
+
+function itemDuration(parsed: ParsedEvents, item: Record<string, unknown>): number | null {
+  if (typeof item.id !== "string") return null;
+  const startedAt = parsed.itemStartedAt[item.id];
+  delete parsed.itemStartedAt[item.id];
+  return startedAt === undefined ? null : Math.max(0, Date.now() - startedAt);
+}
+
+function fileChangeSummary(item: Record<string, unknown>): string {
+  if (!Array.isArray(item.changes)) return "File changes applied";
+  const changes = item.changes
+    .slice(0, 5)
+    .map((change) => {
+      if (!change || typeof change !== "object") return null;
+      const record = change as Record<string, unknown>;
+      const kind = traceText(record.kind, "changed");
+      const path = traceText(record.path, "unknown file");
+      return kind + " " + path;
+    })
+    .filter((change): change is string => change !== null);
+  return changes.length ? "Files: " + changes.join(", ") : "File changes applied";
 }
 
 export function buildCodexArgs(
@@ -41,7 +96,11 @@ export function buildCodexArgs(
   return args;
 }
 
-export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
+export function parseCodexEventLine(
+  line: string,
+  parsed: ParsedEvents,
+  onTrace?: (event: RunnerTraceEvent) => void,
+): void {
   let event: Record<string, unknown>;
   try {
     event = JSON.parse(line) as Record<string, unknown>;
@@ -49,8 +108,36 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
     return;
   }
 
+  if (event.type === "turn.started") {
+    const timestamp = new Date();
+    parsed.turnStartedAt = timestamp.getTime();
+    onTrace?.({
+      type: "model.requested",
+      status: "info",
+      timestamp: timestamp.toISOString(),
+      durationMs: null,
+      summary: "Codex model turn started",
+      error: null,
+    });
+  }
+
   if (event.type === "thread.started" && typeof event.thread_id === "string") {
     parsed.threadId = event.thread_id;
+  }
+
+  if (event.type === "item.started" && event.item && typeof event.item === "object") {
+    const item = event.item as Record<string, unknown>;
+    if (typeof item.id === "string") parsed.itemStartedAt[item.id] = Date.now();
+    if (typeof item.type === "string" && toolItemTypes.has(item.type)) {
+      onTrace?.({
+        type: "tool.started",
+        status: "info",
+        timestamp: new Date().toISOString(),
+        durationMs: null,
+        summary: itemSummary(item),
+        error: null,
+      });
+    }
   }
 
   if (event.type === "item.completed" && event.item && typeof event.item === "object") {
@@ -58,21 +145,62 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
     if (item.type === "agent_message" && typeof item.text === "string") {
       parsed.messages.push(item.text);
     }
+    if (typeof item.type === "string" && toolItemTypes.has(item.type)) {
+      const exitCode = typeof item.exit_code === "number" ? item.exit_code : null;
+      const failed = item.status === "failed" || (exitCode !== null && exitCode !== 0);
+      onTrace?.({
+        type: failed ? "tool.failed" : "tool.completed",
+        status: failed ? "error" : "success",
+        timestamp: new Date().toISOString(),
+        durationMs: itemDuration(parsed, item),
+        summary: itemSummary(item),
+        error: failed
+          ? exitCode === null
+            ? "Tool operation failed"
+            : "Command exited with code " + exitCode
+          : null,
+      });
+    }
+    if (item.type === "file_change") {
+      onTrace?.({
+        type: "file.changed",
+        status: item.status === "failed" ? "error" : "success",
+        timestamp: new Date().toISOString(),
+        durationMs: itemDuration(parsed, item),
+        summary: fileChangeSummary(item),
+        error: item.status === "failed" ? "File change failed" : null,
+      });
+    }
   }
 
-  if (event.type === "turn.completed" && event.usage && typeof event.usage === "object") {
-    const usage = event.usage as Record<string, unknown>;
-    parsed.usage = {
-      ...(typeof usage.input_tokens === "number"
-        ? { inputTokens: usage.input_tokens }
-        : {}),
-      ...(typeof usage.cached_input_tokens === "number"
-        ? { cachedInputTokens: usage.cached_input_tokens }
-        : {}),
-      ...(typeof usage.output_tokens === "number"
-        ? { outputTokens: usage.output_tokens }
-        : {}),
-    };
+  if (event.type === "turn.completed") {
+    if (event.usage && typeof event.usage === "object") {
+      const usage = event.usage as Record<string, unknown>;
+      parsed.usage = {
+        ...(typeof usage.input_tokens === "number"
+          ? { inputTokens: usage.input_tokens }
+          : {}),
+        ...(typeof usage.cached_input_tokens === "number"
+          ? { cachedInputTokens: usage.cached_input_tokens }
+          : {}),
+        ...(typeof usage.output_tokens === "number"
+          ? { outputTokens: usage.output_tokens }
+          : {}),
+      };
+    }
+
+    const timestamp = new Date();
+    onTrace?.({
+      type: "model.completed",
+      status: "success",
+      timestamp: timestamp.toISOString(),
+      durationMs:
+        parsed.turnStartedAt === null
+          ? null
+          : Math.max(0, timestamp.getTime() - parsed.turnStartedAt),
+      summary: "Codex model turn completed",
+      error: null,
+    });
   }
 
   if (event.type === "error") {
@@ -154,6 +282,8 @@ export class CodexRunner implements AgentRunner {
       threadId: request.threadId,
       usage: null,
       errors: [],
+      turnStartedAt: null,
+      itemStartedAt: {},
     };
     let stdout = "";
     let stderr = "";
@@ -171,7 +301,7 @@ export class CodexRunner implements AgentRunner {
         const lines = stdout.split(/\r?\n/);
         stdout = lines.pop() ?? "";
         for (const line of lines) {
-          parseCodexEventLine(line, parsed);
+          parseCodexEventLine(line, parsed, request.onTrace);
         }
       } else {
         stderr += chunk.toString("utf8");
@@ -196,7 +326,7 @@ export class CodexRunner implements AgentRunner {
         child.once("close", (code) => resolve(code ?? 1));
       });
       if (stdout.trim()) {
-        parseCodexEventLine(stdout.trim(), parsed);
+        parseCodexEventLine(stdout.trim(), parsed, request.onTrace);
       }
       if (active.cancelled) {
         throw new RunCancelledError();

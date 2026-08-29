@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
+import type { RunnerTraceEvent } from "./types.js";
 
 describe("Codex runner protocol", () => {
   it("builds a new-session invocation", () => {
@@ -47,6 +48,8 @@ describe("Codex runner protocol", () => {
         outputTokens?: number;
       } | null,
       errors: [] as string[],
+      turnStartedAt: null as number | null,
+      itemStartedAt: {} as Record<string, number>,
     };
     parseCodexEventLine(
       JSON.stringify({ type: "thread.started", thread_id: "thread-123" }),
@@ -69,5 +72,128 @@ describe("Codex runner protocol", () => {
     expect(parsed.threadId).toBe("thread-123");
     expect(parsed.messages).toEqual(["Done."]);
     expect(parsed.usage).toEqual({ inputTokens: 10, outputTokens: 4 });
+  });
+
+  it("emits model lifecycle Trace events", () => {
+    const parsed = {
+      messages: [] as string[],
+      threadId: null as string | null,
+      usage: null,
+      errors: [] as string[],
+      turnStartedAt: null as number | null,
+      itemStartedAt: {} as Record<string, number>,
+    };
+    const traces: RunnerTraceEvent[] = [];
+    const collect = (event: RunnerTraceEvent) => traces.push(event);
+
+    parseCodexEventLine(JSON.stringify({ type: "turn.started" }), parsed, collect);
+    parseCodexEventLine(
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 10, output_tokens: 4 },
+      }),
+      parsed,
+      collect,
+    );
+
+    expect(traces.map((event) => event.type)).toEqual([
+      "model.requested",
+      "model.completed",
+    ]);
+    expect(traces[1]).toMatchObject({
+      status: "success",
+      durationMs: expect.any(Number),
+    });
+  });
+
+  it("emits command and file Trace events without storing file contents", () => {
+    const parsed = {
+      messages: [] as string[],
+      threadId: null as string | null,
+      usage: null,
+      errors: [] as string[],
+      turnStartedAt: null as number | null,
+      itemStartedAt: {} as Record<string, number>,
+    };
+    const traces: RunnerTraceEvent[] = [];
+    const collect = (event: RunnerTraceEvent) => traces.push(event);
+
+    parseCodexEventLine(
+      JSON.stringify({
+        type: "item.started",
+        item: {
+          id: "command-1",
+          type: "command_execution",
+          command: "printf secret-content > hello.txt",
+        },
+      }),
+      parsed,
+      collect,
+    );
+    parseCodexEventLine(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          id: "command-1",
+          type: "command_execution",
+          command: "printf secret-content > hello.txt",
+          exit_code: 0,
+          status: "completed",
+        },
+      }),
+      parsed,
+      collect,
+    );
+    parseCodexEventLine(
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          id: "file-1",
+          type: "file_change",
+          status: "completed",
+          changes: [{ path: "/workspace/hello.txt", kind: "add" }],
+        },
+      }),
+      parsed,
+      collect,
+    );
+
+    expect(traces.map((event) => event.type)).toEqual([
+      "tool.started",
+      "tool.completed",
+      "file.changed",
+    ]);
+    expect(traces[2]?.summary).toContain("/workspace/hello.txt");
+    expect(traces[2]?.summary).not.toContain("secret-content");
+    expect(traces[0]?.summary).not.toContain("secret-content");
+  });
+
+  it("does not store credentials from command arguments", () => {
+    const parsed = {
+      messages: [] as string[],
+      threadId: null as string | null,
+      usage: null,
+      errors: [] as string[],
+      turnStartedAt: null as number | null,
+      itemStartedAt: {} as Record<string, number>,
+    };
+    const traces: RunnerTraceEvent[] = [];
+
+    parseCodexEventLine(
+      JSON.stringify({
+        type: "item.started",
+        item: {
+          id: "command-2",
+          type: "command_execution",
+          command: "curl -H 'Authorization: Bearer private-token' API_KEY=private-key",
+        },
+      }),
+      parsed,
+      (event) => traces.push(event),
+    );
+
+    expect(traces[0]?.summary).toBe("Command execution: curl");
+    expect(traces[0]?.summary).not.toContain("private-token");
+    expect(traces[0]?.summary).not.toContain("private-key");
   });
 });

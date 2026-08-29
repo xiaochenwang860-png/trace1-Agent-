@@ -1,40 +1,137 @@
-import { randomUUID } from "node:crypto";
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  scrypt,
+  timingSafeEqual,
+} from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import { createTextRedactor, redactNullable, type TextRedactor } from "./redaction.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
   AgentRun,
+  DeveloperAnalytics,
+  DeveloperAgentMetric,
   AgentRunner,
   CreateAgentInput,
+  Database,
+  DeveloperUserSummary,
   Message,
+  RunnerTraceEvent,
+  TraceEvent,
   UpdateAgentInput,
+  User,
 } from "./types.js";
-import { WorkspaceManager } from "./workspace.js";
+import {
+  diffWorkspaceSnapshots,
+  WorkspaceManager,
+  type WorkspaceSnapshot,
+} from "./workspace.js";
 
 const now = () => new Date().toISOString();
+const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1_000;
+
+function normalizedLoginName(value: string): string {
+  return value.trim().normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
+function derivePasswordHash(password: string, salt: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    scrypt(password, salt, 64, (error, key) => {
+      if (error) reject(error);
+      else resolve(key.toString("hex"));
+    });
+  });
+}
+
+function hashSessionToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function secureTextMatch(expected: string, candidate: string): boolean {
+  const expectedBuffer = Buffer.from(expected);
+  const candidateBuffer = Buffer.from(candidate);
+  return (
+    expectedBuffer.length === candidateBuffer.length &&
+    timingSafeEqual(expectedBuffer, candidateBuffer)
+  );
+}
+
+type TraceEventInput = Omit<
+  TraceEvent,
+  "id" | "traceId" | "spanId" | "parentSpanId" | "timestamp"
+> & {
+  timestamp?: string | undefined;
+};
+
+const runtimeChildEventTypes = new Set<TraceEvent["type"]>([
+  "model.requested",
+  "model.completed",
+  "tool.started",
+  "tool.completed",
+  "tool.failed",
+  "file.changed",
+]);
 
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
+  private readonly redactText: TextRedactor;
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
-  ) {}
+  ) {
+    this.redactText = createTextRedactor(config);
+  }
 
   async initialize(): Promise<void> {
-    await this.store.initialize();
+    const defaultAccount = this.config.userAccounts.find((account) => account.token.length > 0);
+    const defaultUser: User | undefined = defaultAccount
+      ? {
+          id: defaultAccount.id,
+          name: defaultAccount.name,
+          createdAt: now(),
+        }
+      : undefined;
+    await this.store.initialize(defaultUser);
     await this.workspaces.initialize();
     await this.store.mutate((database) => {
+      this.redactPersistedText(database);
+      for (const account of this.config.userAccounts) {
+        if (!account.token) continue;
+        const existing = database.users.find((user) => user.id === account.id);
+        if (existing) {
+          existing.name = account.name;
+        } else {
+          database.users.push({ id: account.id, name: account.name, createdAt: now() });
+        }
+      }
+      database.authSessions = database.authSessions.filter(
+        (session) => Date.parse(session.expiresAt) > Date.now(),
+      );
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
+          const completedAt = now();
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
-          run.completedAt = now();
+          run.completedAt = completedAt;
+          this.addTrace(database, {
+            runId: run.id,
+            agentId: run.agentId,
+            type: "run.cancelled",
+            status: "info",
+            durationMs: run.startedAt
+              ? Date.parse(completedAt) - Date.parse(run.startedAt)
+              : null,
+            summary: "Run cancelled because the server restarted",
+            error: null,
+          });
         }
       }
       for (const agent of database.agents) {
@@ -44,30 +141,126 @@ export class AgentService {
         }
       }
     });
+    await Promise.all(
+      this.store
+        .snapshot()
+        .agents.map((agent) => this.workspaces.writeInstructions(agent).catch(() => undefined)),
+    );
   }
 
-  listAgents(): Agent[] {
+  async registerUser(name: string, password: string): Promise<{ user: User; token: string }> {
+    const displayName = name.trim().normalize("NFKC");
+    const loginName = normalizedLoginName(displayName);
+    const timestamp = now();
+    const user: User = { id: randomUUID(), name: displayName, createdAt: timestamp };
+    const passwordSalt = randomBytes(16).toString("hex");
+    const passwordHash = await derivePasswordHash(password, passwordSalt);
+
+    await this.store.mutate((database) => {
+      const nameTaken = database.users.some(
+        (candidate) => normalizedLoginName(candidate.name) === loginName,
+      );
+      if (nameTaken || database.credentials.some((credential) => credential.loginName === loginName)) {
+        throw new HttpError(409, "That username is already registered");
+      }
+      database.users.push(user);
+      database.credentials.push({
+        userId: user.id,
+        loginName,
+        passwordSalt,
+        passwordHash,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    });
+
+    return { user, token: await this.issueSession(user.id) };
+  }
+
+  async loginUser(name: string, password: string): Promise<{ user: User; token: string }> {
+    const database = this.store.snapshot();
+    const credential = database.credentials.find(
+      (candidate) => candidate.loginName === normalizedLoginName(name),
+    );
+    if (!credential) throw new HttpError(401, "Username or password is incorrect");
+    const candidateHash = await derivePasswordHash(password, credential.passwordSalt);
+    if (!secureTextMatch(credential.passwordHash, candidateHash)) {
+      throw new HttpError(401, "Username or password is incorrect");
+    }
+    const user = database.users.find((candidate) => candidate.id === credential.userId);
+    if (!user) throw new HttpError(401, "Username or password is incorrect");
+    return { user, token: await this.issueSession(user.id) };
+  }
+
+  authenticateSession(token: string): User | null {
+    if (!token) return null;
+    const database = this.store.snapshot();
+    const tokenHash = hashSessionToken(token);
+    const session = database.authSessions.find(
+      (candidate) =>
+        Date.parse(candidate.expiresAt) > Date.now() &&
+        secureTextMatch(candidate.tokenHash, tokenHash),
+    );
+    return session
+      ? (database.users.find((user) => user.id === session.userId) ?? null)
+      : null;
+  }
+
+  async revokeSession(token: string): Promise<void> {
+    if (!token) return;
+    const tokenHash = hashSessionToken(token);
+    await this.store.mutate((database) => {
+      database.authSessions = database.authSessions.filter(
+        (session) => !secureTextMatch(session.tokenHash, tokenHash),
+      );
+    });
+  }
+
+  private async issueSession(userId: string): Promise<string> {
+    const token = randomBytes(32).toString("base64url");
+    const timestamp = new Date();
+    await this.store.mutate((database) => {
+      database.authSessions = database.authSessions.filter(
+        (session) => Date.parse(session.expiresAt) > timestamp.getTime(),
+      );
+      database.authSessions.push({
+        id: randomUUID(),
+        userId,
+        tokenHash: hashSessionToken(token),
+        createdAt: timestamp.toISOString(),
+        expiresAt: new Date(timestamp.getTime() + sessionLifetimeMs).toISOString(),
+      });
+    });
+    return token;
+  }
+
+  listAgents(ownerUserId?: string): Agent[] {
     return this.store
       .snapshot()
-      .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      .agents.filter((agent) => !ownerUserId || agent.ownerUserId === ownerUserId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  getAgent(id: string): Agent {
+  getAgent(id: string, ownerUserId?: string): Agent {
     const agent = this.store.snapshot().agents.find((item) => item.id === id);
-    if (!agent) {
+    if (!agent || (ownerUserId && agent.ownerUserId !== ownerUserId)) {
       throw new HttpError(404, "Agent not found");
     }
     return agent;
   }
 
-  async createAgent(input: CreateAgentInput): Promise<Agent> {
+  async createAgent(
+    input: CreateAgentInput,
+    ownerUserId: string = this.config.userAccounts[0]!.id,
+  ): Promise<Agent> {
     const timestamp = now();
     const id = randomUUID();
     const agent: Agent = {
       id,
-      name: input.name.trim(),
-      description: input.description?.trim() ?? "",
-      instructions: input.instructions?.trim() ?? "",
+      ownerUserId,
+      name: this.redactText(input.name.trim()),
+      description: this.redactText(input.description?.trim() ?? ""),
+      instructions: this.redactText(input.instructions?.trim() ?? ""),
       status: "ready",
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
@@ -80,22 +273,26 @@ export class AgentService {
     return agent;
   }
 
-  async updateAgent(id: string, input: UpdateAgentInput): Promise<Agent> {
-    const current = this.getAgent(id);
+  async updateAgent(
+    id: string,
+    input: UpdateAgentInput,
+    ownerUserId?: string,
+  ): Promise<Agent> {
+    const current = this.getAgent(id, ownerUserId);
     if (current.status === "busy") {
       throw new HttpError(409, "Stop the active run before editing this Agent");
     }
     const updated = await this.store.mutate((database) => {
       const agent = database.agents.find((item) => item.id === id);
-      if (!agent) {
+      if (!agent || (ownerUserId && agent.ownerUserId !== ownerUserId)) {
         throw new HttpError(404, "Agent not found");
       }
       if (agent.status === "busy") {
         throw new HttpError(409, "Stop the active run before editing this Agent");
       }
-      if (input.name !== undefined) agent.name = input.name.trim();
-      if (input.description !== undefined) agent.description = input.description.trim();
-      if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
+      if (input.name !== undefined) agent.name = this.redactText(input.name.trim());
+      if (input.description !== undefined) agent.description = this.redactText(input.description.trim());
+      if (input.instructions !== undefined) agent.instructions = this.redactText(input.instructions.trim());
       agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);
@@ -104,69 +301,86 @@ export class AgentService {
     return updated;
   }
 
-  async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
-    const agent = this.getAgent(id);
+  async deleteAgent(
+    id: string,
+    ownerUserId?: string,
+  ): Promise<{ archivedWorkspace: string }> {
+    const agent = this.getAgent(id, ownerUserId);
     await this.cancelExecution(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
       database.agents = database.agents.filter((item) => item.id !== id);
       database.messages = database.messages.filter((item) => item.agentId !== id);
       database.runs = database.runs.filter((item) => item.agentId !== id);
+      database.traces = database.traces.filter((event) => event.agentId !== id);
     });
     return { archivedWorkspace };
   }
 
-  async startAgent(id: string): Promise<Agent> {
+  async startAgent(id: string, ownerUserId?: string): Promise<Agent> {
+    this.getAgent(id, ownerUserId);
     return this.setStatus(id, "ready");
   }
 
-  async stopAgent(id: string): Promise<Agent> {
-    this.getAgent(id);
+  async stopAgent(id: string, ownerUserId?: string): Promise<Agent> {
+    this.getAgent(id, ownerUserId);
     await this.cancelExecution(id);
     return this.setStatus(id, "stopped");
   }
 
-  getMessages(agentId: string): Message[] {
-    this.getAgent(agentId);
+  getMessages(agentId: string, ownerUserId?: string): Message[] {
+    this.getAgent(agentId, ownerUserId);
     return this.store
       .snapshot()
       .messages.filter((message) => message.agentId === agentId)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
-  getRun(runId: string): AgentRun {
+  getRun(runId: string, ownerUserId?: string): AgentRun {
     const run = this.store.snapshot().runs.find((item) => item.id === runId);
     if (!run) {
       throw new HttpError(404, "Run not found");
     }
+    this.getAgent(run.agentId, ownerUserId);
     return run;
   }
 
-  getRuns(agentId: string): AgentRun[] {
-    this.getAgent(agentId);
+  getRuns(agentId: string, ownerUserId?: string): AgentRun[] {
+    this.getAgent(agentId, ownerUserId);
     return this.store
       .snapshot()
       .runs.filter((run) => run.agentId === agentId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
+  getTrace(runId: string, ownerUserId?: string): TraceEvent[] {
+    this.getRun(runId, ownerUserId);
+    return this.store
+      .snapshot()
+      .traces.filter((event) => event.runId === runId)
+      .sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+  }
+
   async sendMessage(
     agentId: string,
     prompt: string,
+    ownerUserId?: string,
   ): Promise<{ run: AgentRun; message: Message }> {
+    this.getAgent(agentId, ownerUserId);
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
         503,
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
+    const safePrompt = this.redactText(prompt);
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
       id: runId,
       agentId,
       status: "queued",
-      prompt,
+      prompt: safePrompt,
       output: null,
       error: null,
       usage: null,
@@ -179,7 +393,7 @@ export class AgentService {
       agentId,
       runId,
       role: "user",
-      content: prompt,
+      content: safePrompt,
       createdAt: timestamp,
     };
     const agentAtStart = await this.store.mutate((database) => {
@@ -195,6 +409,15 @@ export class AgentService {
       }
       database.runs.push(run);
       database.messages.push(message);
+      this.addTrace(database, {
+        runId: run.id,
+        agentId,
+        type: "run.started",
+        status: "info",
+        durationMs: null,
+        summary: "Task accepted and queued",
+        error: null,
+      });
       const snapshot = structuredClone(storedAgent);
       storedAgent.status = "busy";
       storedAgent.lastError = null;
@@ -232,14 +455,225 @@ export class AgentService {
     };
   }
 
+  developerOverview(): {
+    users: DeveloperUserSummary[];
+    agents: Agent[];
+    runs: AgentRun[];
+  } {
+    const database = this.store.snapshot();
+    const users = database.users
+      .map((user) => {
+        const userAgents = database.agents.filter(
+          (agent) => agent.ownerUserId === user.id,
+        );
+        const agentIds = new Set(userAgents.map((agent) => agent.id));
+        const runs = database.runs.filter((run) => agentIds.has(run.agentId));
+        const activityTimes = [
+          ...userAgents.map((agent) => agent.updatedAt),
+          ...runs.map((run) => run.completedAt ?? run.startedAt ?? run.createdAt),
+        ];
+        return {
+          ...user,
+          agentCount: userAgents.length,
+          runCount: runs.length,
+          failedRunCount: runs.filter((run) => run.status === "failed").length,
+          lastActivityAt: activityTimes.sort().at(-1) ?? null,
+        } satisfies DeveloperUserSummary;
+      })
+      .sort((left, right) =>
+        (right.lastActivityAt ?? right.createdAt).localeCompare(
+          left.lastActivityAt ?? left.createdAt,
+        ),
+      );
+    return {
+      users,
+      agents: database.agents.sort((left, right) =>
+        right.updatedAt.localeCompare(left.updatedAt),
+      ),
+      runs: database.runs.sort((left, right) =>
+        right.createdAt.localeCompare(left.createdAt),
+      ),
+    };
+  }
+
+  developerAnalytics(ownerUserId: string): DeveloperAnalytics {
+    const database = this.store.snapshot();
+    const agents = database.agents.filter((agent) => agent.ownerUserId === ownerUserId);
+    const agentIds = new Set(agents.map((agent) => agent.id));
+    const runs = database.runs.filter((run) => agentIds.has(run.agentId));
+    const durationOf = (run: AgentRun): number | null => {
+      if (!run.startedAt || !run.completedAt) return null;
+      const duration = Date.parse(run.completedAt) - Date.parse(run.startedAt);
+      return Number.isFinite(duration) && duration >= 0 ? duration : null;
+    };
+    const averageDuration = (items: AgentRun[]): number | null => {
+      const durations = items.map(durationOf).filter((value): value is number => value !== null);
+      if (durations.length === 0) return null;
+      return Math.round(durations.reduce((total, value) => total + value, 0) / durations.length);
+    };
+    const sumUsage = (items: AgentRun[]) =>
+      items.reduce(
+        (usage, run) => ({
+          inputTokens: usage.inputTokens + (run.usage?.inputTokens ?? 0),
+          cachedInputTokens: usage.cachedInputTokens + (run.usage?.cachedInputTokens ?? 0),
+          outputTokens: usage.outputTokens + (run.usage?.outputTokens ?? 0),
+        }),
+        { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      );
+    const completedRunCount = runs.filter((run) => run.status === "completed").length;
+    const failedRunCount = runs.filter((run) => run.status === "failed").length;
+    const settledRunCount = runs.filter((run) =>
+      ["completed", "failed", "cancelled"].includes(run.status),
+    ).length;
+    const agentsWithMetrics: DeveloperAgentMetric[] = agents
+      .map((agent) => {
+        const agentRuns = runs.filter((run) => run.agentId === agent.id);
+        const usage = sumUsage(agentRuns);
+        return {
+          agentId: agent.id,
+          agentName: agent.name,
+          runCount: agentRuns.length,
+          completedRunCount: agentRuns.filter((run) => run.status === "completed").length,
+          failedRunCount: agentRuns.filter((run) => run.status === "failed").length,
+          averageDurationMs: averageDuration(agentRuns),
+          ...usage,
+          lastRunAt:
+            agentRuns
+              .map((run) => run.completedAt ?? run.startedAt ?? run.createdAt)
+              .sort()
+              .at(-1) ?? null,
+        };
+      })
+      .sort((left, right) => right.runCount - left.runCount || left.agentName.localeCompare(right.agentName));
+    const usage = sumUsage(runs);
+    return {
+      userId: ownerUserId,
+      totalRuns: runs.length,
+      completedRunCount,
+      failedRunCount,
+      successRate: settledRunCount === 0 ? null : completedRunCount / settledRunCount,
+      averageDurationMs: averageDuration(runs),
+      ...usage,
+      agents: agentsWithMetrics,
+    };
+  }
+  private addTrace(database: Database, event: TraceEventInput): void {
+    const { timestamp = now(), ...details } = event;
+    const id = randomUUID();
+    const rootSpan = database.traces.find(
+      (candidate) => candidate.runId === event.runId && candidate.type === "run.started",
+    );
+    const runtimeSpan = database.traces.find(
+      (candidate) =>
+        candidate.runId === event.runId && candidate.type === "runtime.started",
+    );
+    const parentSpanId =
+      event.type === "run.started"
+        ? null
+        : runtimeChildEventTypes.has(event.type)
+          ? (runtimeSpan?.spanId ?? rootSpan?.spanId ?? null)
+          : (rootSpan?.spanId ?? null);
+    database.traces.push({
+      id,
+      traceId: event.runId,
+      spanId: id,
+      parentSpanId,
+      timestamp,
+      ...details,
+      summary: this.redactText(details.summary),
+      error: redactNullable(this.redactText, details.error),
+    });
+  }
+
+  private redactPersistedText(database: Database): void {
+    for (const agent of database.agents) {
+      agent.name = this.redactText(agent.name);
+      agent.description = this.redactText(agent.description);
+      agent.instructions = this.redactText(agent.instructions);
+      agent.lastError = redactNullable(this.redactText, agent.lastError);
+    }
+    for (const message of database.messages) {
+      message.content = this.redactText(message.content);
+    }
+    for (const run of database.runs) {
+      run.prompt = this.redactText(run.prompt);
+      run.output = redactNullable(this.redactText, run.output);
+      run.error = redactNullable(this.redactText, run.error);
+    }
+    for (const trace of database.traces) {
+      trace.summary = this.redactText(trace.summary);
+      trace.error = redactNullable(this.redactText, trace.error);
+    }
+  }
+
+  private addRunnerTraces(
+    database: Database,
+    runId: string,
+    agentId: string,
+    events: RunnerTraceEvent[],
+  ): void {
+    for (const event of events) {
+      this.addTrace(database, {
+        runId,
+        agentId,
+        ...event,
+      });
+    }
+  }
+
+  private async appendWorkspaceTraces(
+    workspacePath: string,
+    before: WorkspaceSnapshot | null,
+    events: RunnerTraceEvent[],
+  ): Promise<void> {
+    if (!before) return;
+    try {
+      const after = await this.workspaces.snapshot(workspacePath);
+      for (const change of diffWorkspaceSnapshots(before, after)) {
+        const containerPath = "/workspace/" + change.path;
+        const alreadyReported = events.some(
+          (event) => event.type === "file.changed" && event.summary.includes(containerPath),
+        );
+        if (alreadyReported) continue;
+        events.push({
+          type: "file.changed",
+          status: "success",
+          timestamp: new Date(change.timestampMs).toISOString(),
+          durationMs: null,
+          summary: "Workspace file " + change.kind + ": " + containerPath,
+          error: null,
+        });
+      }
+    } catch {
+      // Observability must not change the outcome of the Agent run.
+    }
+  }
+
   private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+    const startedAt = now();
+    const runnerTraces: RunnerTraceEvent[] = [];
+    let workspaceBefore: WorkspaceSnapshot | null = null;
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
         storedRun.status = "running";
-        storedRun.startedAt = now();
+        storedRun.startedAt = startedAt;
+        this.addTrace(database, {
+          runId: run.id,
+          agentId: agentAtStart.id,
+          type: "runtime.started",
+          status: "info",
+          durationMs: null,
+          summary: "Agent Runtime execution started",
+          error: null,
+        });
       }
     });
+    try {
+      workspaceBefore = await this.workspaces.snapshot(agentAtStart.workspacePath);
+    } catch {
+      workspaceBefore = null;
+    }
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
@@ -249,22 +683,38 @@ export class AgentService {
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
+        onTrace: (event) => runnerTraces.push(event),
       });
+      await this.appendWorkspaceTraces(
+        agentAtStart.workspacePath,
+        workspaceBefore,
+        runnerTraces,
+      );
       const completedAt = now();
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (!storedRun || !agent) return;
         storedRun.status = "completed";
-        storedRun.output = result.output;
+        storedRun.output = this.redactText(result.output);
         storedRun.usage = result.usage;
         storedRun.completedAt = completedAt;
+        this.addRunnerTraces(database, run.id, agent.id, runnerTraces);
+        this.addTrace(database, {
+          runId: run.id,
+          agentId: agent.id,
+          type: "run.completed",
+          status: "success",
+          durationMs: Date.parse(completedAt) - Date.parse(startedAt),
+          summary: "Agent Runtime execution completed",
+          error: null,
+        });
         database.messages.push({
           id: randomUUID(),
           agentId: agent.id,
           runId: run.id,
           role: "assistant",
-          content: result.output,
+          content: this.redactText(result.output),
           createdAt: completedAt,
         });
         agent.status = "ready";
@@ -273,9 +723,14 @@ export class AgentService {
         agent.updatedAt = completedAt;
       });
     } catch (error) {
+      await this.appendWorkspaceTraces(
+        agentAtStart.workspacePath,
+        workspaceBefore,
+        runnerTraces,
+      );
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
-      const message = error instanceof Error ? error.message : String(error);
+      const message = this.redactText(error instanceof Error ? error.message : String(error));
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -283,6 +738,23 @@ export class AgentService {
           storedRun.status = cancelled ? "cancelled" : "failed";
           storedRun.error = message;
           storedRun.completedAt = completedAt;
+          this.addRunnerTraces(
+            database,
+            run.id,
+            agentAtStart.id,
+            runnerTraces,
+          );
+          this.addTrace(database, {
+            runId: run.id,
+            agentId: agentAtStart.id,
+            type: cancelled ? "run.cancelled" : "run.failed",
+            status: cancelled ? "info" : "error",
+            durationMs: Date.parse(completedAt) - Date.parse(startedAt),
+            summary: cancelled
+              ? "Agent Runtime execution cancelled"
+              : "Agent Runtime execution failed",
+            error: cancelled ? null : message,
+          });
         }
         if (agent) {
           if (agent.status !== "stopped") {

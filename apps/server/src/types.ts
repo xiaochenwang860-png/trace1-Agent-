@@ -2,8 +2,65 @@ export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type MessageRole = "user" | "assistant";
 
+export interface User {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
+export interface UserCredential {
+  userId: string;
+  loginName: string;
+  passwordSalt: string;
+  passwordHash: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthSession {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface DeveloperUserSummary extends User {
+  agentCount: number;
+  runCount: number;
+  failedRunCount: number;
+  lastActivityAt: string | null;
+}
+
+export interface DeveloperAgentMetric {
+  agentId: string;
+  agentName: string;
+  runCount: number;
+  completedRunCount: number;
+  failedRunCount: number;
+  averageDurationMs: number | null;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  lastRunAt: string | null;
+}
+
+export interface DeveloperAnalytics {
+  userId: string;
+  totalRuns: number;
+  completedRunCount: number;
+  failedRunCount: number;
+  successRate: number | null;
+  averageDurationMs: number | null;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  agents: DeveloperAgentMetric[];
+}
+
 export interface Agent {
   id: string;
+  ownerUserId: string;
   name: string;
   description: string;
   instructions: string;
@@ -42,12 +99,58 @@ export interface AgentRun {
   completedAt: string | null;
   createdAt: string;
 }
+export type TraceEventType =
+  | "run.started"
+  | "runtime.started"
+  | "model.requested"
+  | "model.completed"
+  | "tool.started"
+  | "tool.completed"
+  | "tool.failed"
+  | "file.changed"
+  | "run.completed"
+  | "run.failed"
+  | "run.cancelled";
+export type TraceEventStatus = "info" | "success" | "error";
+export interface TraceEvent {
+  id: string;
+  traceId: string;
+  spanId: string;
+  parentSpanId: string | null;
+  runId: string;
+  agentId: string;
+  type: TraceEventType;
+  status: TraceEventStatus;
+  timestamp: string;
+  durationMs: number | null;
+  summary: string;
+  error: string | null;
+}
+
+export interface RunnerTraceEvent {
+  type:
+    | "model.requested"
+    | "model.completed"
+    | "tool.started"
+    | "tool.completed"
+    | "tool.failed"
+    | "file.changed";
+  status: TraceEventStatus;
+  timestamp: string;
+  durationMs: number | null;
+  summary: string;
+  error: string | null;
+}
 
 export interface Database {
-  version: 1;
+  version: 3;
+  users: User[];
+  credentials: UserCredential[];
+  authSessions: AuthSession[];
   agents: Agent[];
   messages: Message[];
   runs: AgentRun[];
+  traces: TraceEvent[];
 }
 
 export interface CreateAgentInput {
@@ -73,6 +176,7 @@ export interface RunnerRequest {
   workspacePath: string;
   prompt: string;
   threadId: string | null;
+  onTrace?: ((event: RunnerTraceEvent) => void) | undefined;
 }
 
 export interface AgentRunner {

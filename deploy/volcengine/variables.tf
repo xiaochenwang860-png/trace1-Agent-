@@ -75,6 +75,16 @@ variable "app_auth_token" {
   }
 }
 
+variable "trace_viewer_token" {
+  description = "Developer-only Glass Box token. Supplied through TF_VAR_trace_viewer_token."
+  type        = string
+  sensitive   = true
+  validation {
+    condition     = length(var.trace_viewer_token) >= 24 && length(var.trace_viewer_token) <= 128 && can(regex("^[A-Za-z0-9._~-]+$", var.trace_viewer_token)) && !startswith(var.trace_viewer_token, "replace-")
+    error_message = "trace_viewer_token must contain 24-128 URL-safe, non-placeholder characters."
+  }
+}
+
 variable "ark_model" {
   description = "Ark endpoint/model ID supporting the Responses API."
   type        = string

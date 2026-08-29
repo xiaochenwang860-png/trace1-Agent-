@@ -38,6 +38,16 @@ const envSchema = z.object({
     .max(128)
     .regex(/^[A-Za-z0-9._~-]*$/, "APP_AUTH_TOKEN must use URL-safe characters")
     .optional(),
+  TRACE_VIEWER_TOKEN: z
+    .string()
+    .trim()
+    .max(128)
+    .regex(
+      /^[A-Za-z0-9._~-]*$/,
+      "TRACE_VIEWER_TOKEN must use URL-safe characters",
+    )
+    .optional(),
+  APP_USERS_JSON: z.string().optional(),
   ARK_API_KEY: z.string().optional(),
   ARK_MODEL: z.string().optional(),
   ARK_BASE_URL: z
@@ -49,14 +59,86 @@ const envSchema = z.object({
 
 export type AppConfig = ReturnType<typeof loadConfig>;
 
+const userAccountsSchema = z
+  .array(
+    z.object({
+      id: z
+        .string()
+        .trim()
+        .min(1)
+        .max(64)
+        .regex(/^[A-Za-z0-9_.-]+$/, "User IDs must use URL-safe characters"),
+      name: z.string().trim().min(1).max(80),
+      token: z
+        .string()
+        .trim()
+        .min(1)
+        .max(128)
+        .refine(
+          (value) => !/[\r\n]/.test(value),
+          "User tokens cannot contain line breaks",
+        ),
+    }),
+  )
+  .min(1)
+  .superRefine((accounts, context) => {
+    const ids = new Set<string>();
+    const tokens = new Set<string>();
+    accounts.forEach((account, index) => {
+      if (ids.has(account.id)) {
+        context.addIssue({
+          code: "custom",
+          path: [index, "id"],
+          message: "User IDs must be unique",
+        });
+      }
+      if (tokens.has(account.token)) {
+        context.addIssue({
+          code: "custom",
+          path: [index, "token"],
+          message: "User tokens must be unique",
+        });
+      }
+      ids.add(account.id);
+      tokens.add(account.token);
+    });
+  });
+
+function parseUserAccounts(raw: string | undefined, legacyToken: string) {
+  if (raw?.trim()) {
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new Error("APP_USERS_JSON must be valid JSON");
+    }
+    return userAccountsSchema.parse(value);
+  }
+  return [
+    {
+      id: "local-user",
+      name: "Local User",
+      token: legacyToken,
+    },
+  ];
+}
+
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const env = envSchema.parse(environment);
   const authToken = env.APP_AUTH_TOKEN?.trim() ?? "";
+  const traceViewerToken = env.TRACE_VIEWER_TOKEN?.trim() ?? "";
+  const userAccounts = parseUserAccounts(env.APP_USERS_JSON, authToken);
   const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
   if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
-    if (authToken.length < 24 || authToken.startsWith("replace-")) {
+    if (
+      userAccounts.some(
+        (account) =>
+          account.token.length > 0 &&
+          (account.token.length < 24 || account.token.startsWith("replace-")),
+      )
+    ) {
       throw new Error(
-        "APP_AUTH_TOKEN must contain at least 24 characters for a non-loopback production server",
+        "Every user access token must contain at least 24 characters for a non-loopback production server",
       );
     }
   }
@@ -84,6 +166,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     containerUser: env.CONTAINER_USER?.trim() || defaultContainerUser,
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     authToken,
+    userAccounts,
+    userAuthRequired: userAccounts.some((account) => account.token.length > 0),
+    traceViewerToken,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel: env.ARK_MODEL?.trim() ?? "",
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),

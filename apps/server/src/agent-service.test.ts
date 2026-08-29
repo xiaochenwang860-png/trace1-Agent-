@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,6 +10,23 @@ import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
   async run(request: RunnerRequest): Promise<RunnerResult> {
+    const startedAt = new Date();
+    request.onTrace?.({
+      type: "model.requested",
+      status: "info",
+      timestamp: startedAt.toISOString(),
+      durationMs: null,
+      summary: "Codex model turn started",
+      error: null,
+    });
+    request.onTrace?.({
+      type: "model.completed",
+      status: "success",
+      timestamp: new Date().toISOString(),
+      durationMs: 1,
+      summary: "Codex model turn completed",
+      error: null,
+    });
     return {
       output: "Completed: " + request.prompt,
       threadId: request.threadId ?? "fake-thread",
@@ -35,7 +52,10 @@ afterEach(async () => {
   );
 });
 
-async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+async function makeService(
+  runner: AgentRunner = new FakeRunner(),
+  environment: NodeJS.ProcessEnv = {},
+): Promise<AgentService> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -45,6 +65,7 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     CODEX_HOME: path.join(root, "codex"),
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
+    ...environment,
   });
   const service = new AgentService(
     config,
@@ -57,6 +78,64 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
 }
 
 describe("Agent lifecycle", () => {
+  it("registers users, verifies hashed passwords, and revokes login sessions", async () => {
+    const service = await makeService();
+    const registered = await service.registerUser("Alice", "correct-horse-42");
+
+    expect(registered.token).not.toContain("correct-horse-42");
+    expect(service.authenticateSession(registered.token)).toMatchObject({
+      id: registered.user.id,
+      name: "Alice",
+    });
+    await expect(service.loginUser("alice", "wrong-password")).rejects.toMatchObject({
+      statusCode: 401,
+    });
+
+    const login = await service.loginUser("ALICE", "correct-horse-42");
+    expect(service.authenticateSession(login.token)?.id).toBe(registered.user.id);
+    await expect(
+      service.registerUser(" alice ", "another-password"),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const agent = await service.createAgent(
+      { name: "Alice Agent" },
+      registered.user.id,
+    );
+    expect(service.listAgents(registered.user.id)).toEqual([agent]);
+    expect(service.developerOverview().users).toContainEqual(
+      expect.objectContaining({
+        id: registered.user.id,
+        name: "Alice",
+        agentCount: 1,
+      }),
+    );
+
+    await service.revokeSession(login.token);
+    expect(service.authenticateSession(login.token)).toBeNull();
+  });
+
+  it("isolates Agents by their owner user", async () => {
+    const service = await makeService(new FakeRunner(), {
+      APP_USERS_JSON: JSON.stringify([
+        { id: "alice", name: "Alice", token: "alice-token" },
+        { id: "bob", name: "Bob", token: "bob-token" },
+      ]),
+    });
+    const aliceAgent = await service.createAgent({ name: "Alice Agent" }, "alice");
+    const bobAgent = await service.createAgent({ name: "Bob Agent" }, "bob");
+
+    expect(service.listAgents("alice").map((agent) => agent.id)).toEqual([
+      aliceAgent.id,
+    ]);
+    expect(service.listAgents("bob").map((agent) => agent.id)).toEqual([
+      bobAgent.id,
+    ]);
+    expect(() => service.getAgent(bobAgent.id, "alice")).toThrow("Agent not found");
+    await expect(
+      service.updateAgent(bobAgent.id, { name: "Stolen" }, "alice"),
+    ).rejects.toMatchObject({ statusCode: 404 });
+  });
+
   it("creates, updates, stops, starts and deletes an Agent", async () => {
     const service = await makeService();
     const agent = await service.createAgent({ name: "Builder" });
@@ -78,6 +157,56 @@ describe("Agent lifecycle", () => {
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(messages[1]?.content).toContain("write hello world");
     expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
+    const trace = service.getTrace(run.id);
+    expect(trace.map((event) => event.type)).toEqual([
+      "run.started",
+      "runtime.started",
+      "model.requested",
+      "model.completed",
+      "run.completed",
+    ]);
+    expect(new Set(trace.map((event) => event.traceId))).toEqual(new Set([run.id]));
+    expect(new Set(trace.map((event) => event.spanId)).size).toBe(trace.length);
+    expect(trace[0]?.parentSpanId).toBeNull();
+    expect(trace[1]?.parentSpanId).toBe(trace[0]?.spanId);
+    expect(trace[2]?.parentSpanId).toBe(trace[1]?.spanId);
+    expect(trace[3]?.parentSpanId).toBe(trace[1]?.spanId);
+    expect(trace[4]?.parentSpanId).toBe(trace[0]?.spanId);
+    expect(trace.at(-1)).toMatchObject({
+      status: "success",
+      durationMs: expect.any(Number),
+    });
+  });
+
+  it("records a failure Trace when the Runtime throws", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(
+          path.join(request.workspacePath, "partial-result.txt"),
+          "created before failure",
+          "utf8",
+        );
+        throw new Error("Runtime unavailable");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Failing Agent" });
+    const { run } = await service.sendMessage(agent.id, "run a task");
+
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+
+    expect(service.getTrace(run.id).map((event) => event.type)).toEqual([
+      "run.started",
+      "runtime.started",
+      "file.changed",
+      "run.failed",
+    ]);
+    expect(service.getTrace(run.id).at(-1)).toMatchObject({
+      status: "error",
+      error: "Runtime unavailable",
+    });
+    expect(service.getTrace(run.id)[2]?.summary).toContain("partial-result.txt");
   });
 
   it("atomically accepts only one concurrent run per Agent", async () => {

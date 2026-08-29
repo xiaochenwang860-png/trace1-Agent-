@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,79 @@ afterEach(async () => {
 });
 
 describe("JsonStore", () => {
+  it("migrates legacy Trace records to stable Trace and Span IDs", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-store-test-"));
+    temporaryDirectories.push(root);
+    const databasePath = path.join(root, "db.json");
+    await writeFile(
+      databasePath,
+      JSON.stringify({
+        version: 1,
+        agents: [],
+        messages: [],
+        runs: [],
+        traces: [
+          {
+            id: "root-event",
+            runId: "run-1",
+            agentId: "agent-1",
+            type: "run.started",
+            status: "info",
+            timestamp: "2026-08-28T00:00:00.000Z",
+            durationMs: null,
+            summary: "Task accepted",
+            error: null,
+          },
+          {
+            id: "runtime-event",
+            runId: "run-1",
+            agentId: "agent-1",
+            type: "runtime.started",
+            status: "info",
+            timestamp: "2026-08-28T00:00:01.000Z",
+            durationMs: null,
+            summary: "Runtime started",
+            error: null,
+          },
+          {
+            id: "model-event",
+            runId: "run-1",
+            agentId: "agent-1",
+            type: "model.requested",
+            status: "info",
+            timestamp: "2026-08-28T00:00:02.000Z",
+            durationMs: null,
+            summary: "Model requested",
+            error: null,
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const store = new JsonStore(databasePath);
+    await store.initialize();
+    const traces = store.snapshot().traces;
+
+    expect(store.snapshot()).toMatchObject({
+      version: 3,
+      users: [{ id: "local-user", name: "Local User" }],
+      credentials: [],
+      authSessions: [],
+    });
+
+    expect(traces.map((event) => event.traceId)).toEqual(["run-1", "run-1", "run-1"]);
+    expect(traces[0]).toMatchObject({ spanId: "root-event", parentSpanId: null });
+    expect(traces[1]).toMatchObject({
+      spanId: "runtime-event",
+      parentSpanId: "root-event",
+    });
+    expect(traces[2]).toMatchObject({
+      spanId: "model-event",
+      parentSpanId: "runtime-event",
+    });
+  });
+
   it("does not publish a mutation in memory when persistence fails", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "launchpad-store-test-"));
     temporaryDirectories.push(root);

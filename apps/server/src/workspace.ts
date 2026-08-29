@@ -1,6 +1,47 @@
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Agent } from "./types.js";
+
+export interface WorkspaceFileState {
+  size: number;
+  modifiedAtMs: number;
+  changedAtMs: number;
+}
+
+export type WorkspaceSnapshot = Map<string, WorkspaceFileState>;
+
+export interface WorkspaceChange {
+  path: string;
+  kind: "created" | "modified" | "deleted";
+  timestampMs: number;
+}
+
+const ignoredDirectories = new Set([".codex", ".git", "dist", "node_modules"]);
+
+export function diffWorkspaceSnapshots(
+  before: WorkspaceSnapshot,
+  after: WorkspaceSnapshot,
+): WorkspaceChange[] {
+  const changes: WorkspaceChange[] = [];
+  for (const [filePath, current] of after) {
+    const previous = before.get(filePath);
+    if (!previous) {
+      changes.push({ path: filePath, kind: "created", timestampMs: current.modifiedAtMs });
+    } else if (
+      previous.size !== current.size ||
+      previous.modifiedAtMs !== current.modifiedAtMs ||
+      previous.changedAtMs !== current.changedAtMs
+    ) {
+      changes.push({ path: filePath, kind: "modified", timestampMs: current.modifiedAtMs });
+    }
+  }
+  for (const [filePath] of before) {
+    if (!after.has(filePath)) {
+      changes.push({ path: filePath, kind: "deleted", timestampMs: Date.now() });
+    }
+  }
+  return changes.sort((left, right) => left.path.localeCompare(right.path));
+}
 
 export class WorkspaceManager {
   constructor(private readonly root: string) {}
@@ -33,6 +74,36 @@ export class WorkspaceManager {
       ].join("\n"),
       "utf8",
     );
+  }
+
+  async snapshot(workspacePath: string): Promise<WorkspaceSnapshot> {
+    const snapshot: WorkspaceSnapshot = new Map();
+    const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
+        const absolutePath = path.join(directory, entry.name);
+        const relativePath = relativeDirectory
+          ? path.posix.join(relativeDirectory, entry.name)
+          : entry.name;
+        if (entry.isDirectory()) {
+          await visit(absolutePath, relativePath);
+        } else if (entry.isFile()) {
+          try {
+            const file = await stat(absolutePath);
+            snapshot.set(relativePath, {
+              size: file.size,
+              modifiedAtMs: file.mtimeMs,
+              changedAtMs: file.ctimeMs,
+            });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        }
+      }
+    };
+    await visit(workspacePath, "");
+    return snapshot;
   }
 
   async writeInstructions(agent: Agent): Promise<void> {
