@@ -146,12 +146,6 @@ git clone https://github.com/<your-github-name>/<your-repository>.git
 cd CodeJam
 ```
 
-如果队友直接拿到压缩包，解压后进入项目目录即可：
-
-```bash
-cd ~/CodeJam
-```
-
 ### 6.2 安全地输入密钥并启动
 
 在项目根目录执行下面的命令。使用 `read -s` 输入 API Key 和开发者密码时，终端不会显示内容，也不会把密钥写进命令历史。
@@ -272,23 +266,6 @@ git status
 - 测试、类型检查和构建全部通过；
 - 没有提交 `.env`、真实 Key、开发者控制台密码、本地数据或工作区文件；
 - README 中的仓库地址、截图和演示步骤符合当前版本；
-- 队友能根据“从零运行”部分成功启动项目。
-
-## 11. 打包给队友
-
-在项目上一级目录执行：
-
-```bash
-cd ..
-zip -r CodeJam-team.zip CodeJam \
-  -x "CodeJam/node_modules/*" \
-     "CodeJam/.git/*" \
-     "CodeJam/.env" \
-     "CodeJam/.data/*" \
-     "CodeJam/.local/*"
-```
-
-建议更优先使用 GitHub 协作：将代码推送到仓库，队友通过 `git clone` 获取；每个人自行配置自己的 ModelArk Key 和开发者控制台密码。
 
 ---
 
