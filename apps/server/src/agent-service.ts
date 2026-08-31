@@ -5,11 +5,13 @@ import {
   scrypt,
   timingSafeEqual,
 } from "node:crypto";
+import path from "node:path";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
 import { createTextRedactor, redactNullable, type TextRedactor } from "./redaction.js";
 import { JsonStore } from "./store.js";
+import { TraceJournal } from "./trace-journal.js";
 import type {
   Agent,
   AgentRun,
@@ -62,14 +64,19 @@ function secureTextMatch(expected: string, candidate: string): boolean {
 
 type TraceEventInput = Omit<
   TraceEvent,
-  "id" | "traceId" | "spanId" | "parentSpanId" | "timestamp"
+  "id" | "traceId" | "spanId" | "parentSpanId" | "sequence" | "timestamp"
 > & {
   timestamp?: string | undefined;
 };
 
 const runtimeChildEventTypes = new Set<TraceEvent["type"]>([
+  "attempt.started",
+  "attempt.completed",
+  "attempt.failed",
+  "retry.scheduled",
   "model.requested",
   "model.completed",
+  "model.failed",
   "tool.started",
   "tool.completed",
   "tool.failed",
@@ -79,7 +86,14 @@ const runtimeChildEventTypes = new Set<TraceEvent["type"]>([
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
+  private readonly liveTraces = new Map<string, TraceEvent[]>();
+  private readonly traceSequences = new Map<string, number>();
+  private readonly traceSubscribers = new Map<
+    string,
+    Set<(event: TraceEvent) => void>
+  >();
   private readonly redactText: TextRedactor;
+  private readonly traceJournal: TraceJournal;
 
   constructor(
     private readonly config: AppConfig,
@@ -88,6 +102,9 @@ export class AgentService {
     private readonly runner: AgentRunner,
   ) {
     this.redactText = createTextRedactor(config);
+    this.traceJournal = new TraceJournal(
+      path.join(config.dataDirectory, "trace-journal"),
+    );
   }
 
   async initialize(): Promise<void> {
@@ -100,8 +117,20 @@ export class AgentService {
         }
       : undefined;
     await this.store.initialize(defaultUser);
+    await this.traceJournal.initialize();
+    const recoveredTraces = await this.traceJournal.recover();
     await this.workspaces.initialize();
     await this.store.mutate((database) => {
+      for (const events of recoveredTraces.values()) {
+        this.addRunnerTraces(database, events);
+      }
+      this.traceSequences.clear();
+      for (const trace of database.traces) {
+        this.traceSequences.set(
+          trace.runId,
+          Math.max(this.traceSequences.get(trace.runId) ?? 0, trace.sequence),
+        );
+      }
       this.redactPersistedText(database);
       for (const account of this.config.userAccounts) {
         if (!account.token) continue;
@@ -141,6 +170,13 @@ export class AgentService {
         }
       }
     });
+    await Promise.all(
+      [...recoveredTraces.keys()].map((runId) =>
+        this.traceJournal.complete(runId).catch((error: unknown) => {
+          console.error("Failed to clean recovered Trace journal", error);
+        }),
+      ),
+    );
     await Promise.all(
       this.store
         .snapshot()
@@ -355,10 +391,32 @@ export class AgentService {
 
   getTrace(runId: string, ownerUserId?: string): TraceEvent[] {
     this.getRun(runId, ownerUserId);
-    return this.store
+    const persisted = this.store
       .snapshot()
       .traces.filter((event) => event.runId === runId)
-      .sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+    const byId = new Map(
+      [...persisted, ...(this.liveTraces.get(runId) ?? [])].map((event) => [
+        event.id,
+        event,
+      ]),
+    );
+    return [...byId.values()].sort((left, right) =>
+      left.sequence - right.sequence || left.timestamp.localeCompare(right.timestamp),
+    );
+  }
+
+  subscribeToTrace(
+    runId: string,
+    subscriber: (event: TraceEvent) => void,
+  ): () => void {
+    this.getRun(runId);
+    const subscribers = this.traceSubscribers.get(runId) ?? new Set();
+    subscribers.add(subscriber);
+    this.traceSubscribers.set(runId, subscribers);
+    return () => {
+      subscribers.delete(subscriber);
+      if (subscribers.size === 0) this.traceSubscribers.delete(runId);
+    };
   }
 
   async sendMessage(
@@ -557,9 +615,36 @@ export class AgentService {
       agents: agentsWithMetrics,
     };
   }
-  private addTrace(database: Database, event: TraceEventInput): void {
+  private createTrace(
+    event: TraceEventInput,
+    parentSpanId: string | null,
+    spanId: string = randomUUID(),
+  ): TraceEvent {
     const { timestamp = now(), ...details } = event;
     const id = randomUUID();
+    return {
+      id,
+      traceId: event.runId,
+      spanId,
+      parentSpanId,
+      sequence: this.nextTraceSequence(event.runId),
+      timestamp,
+      ...details,
+      summary: this.redactText(details.summary),
+      error: redactNullable(this.redactText, details.error),
+      ...(details.errorCode
+        ? { errorCode: this.redactText(details.errorCode).slice(0, 64) }
+        : {}),
+    };
+  }
+
+  private nextTraceSequence(runId: string): number {
+    const sequence = (this.traceSequences.get(runId) ?? 0) + 1;
+    this.traceSequences.set(runId, sequence);
+    return sequence;
+  }
+
+  private addTrace(database: Database, event: TraceEventInput): TraceEvent {
     const rootSpan = database.traces.find(
       (candidate) => candidate.runId === event.runId && candidate.type === "run.started",
     );
@@ -573,16 +658,9 @@ export class AgentService {
         : runtimeChildEventTypes.has(event.type)
           ? (runtimeSpan?.spanId ?? rootSpan?.spanId ?? null)
           : (rootSpan?.spanId ?? null);
-    database.traces.push({
-      id,
-      traceId: event.runId,
-      spanId: id,
-      parentSpanId,
-      timestamp,
-      ...details,
-      summary: this.redactText(details.summary),
-      error: redactNullable(this.redactText, details.error),
-    });
+    const trace = this.createTrace(event, parentSpanId);
+    database.traces.push(trace);
+    return trace;
   }
 
   private redactPersistedText(database: Database): void {
@@ -608,23 +686,55 @@ export class AgentService {
 
   private addRunnerTraces(
     database: Database,
-    runId: string,
-    agentId: string,
-    events: RunnerTraceEvent[],
+    events: TraceEvent[],
   ): void {
     for (const event of events) {
-      this.addTrace(database, {
-        runId,
-        agentId,
-        ...event,
-      });
+      if (!database.traces.some((candidate) => candidate.id === event.id)) {
+        database.traces.push(event);
+      }
+    }
+  }
+
+  private captureRunnerTrace(
+    runId: string,
+    agentId: string,
+    parentSpanId: string | null,
+    event: RunnerTraceEvent,
+    events: TraceEvent[],
+  ): void {
+    const { operationId, parentOperationId, ...details } = event;
+    const trace = this.createTrace(
+      { runId, agentId, ...details },
+      parentOperationId ?? parentSpanId,
+      operationId,
+    );
+    events.push(trace);
+    const live = this.liveTraces.get(runId) ?? [];
+    live.push(trace);
+    this.liveTraces.set(runId, live);
+    void this.traceJournal.append(trace).catch((error: unknown) => {
+      console.error("Failed to append Trace journal", error);
+    });
+    this.notifyTrace(trace);
+  }
+
+  private notifyTrace(event: TraceEvent): void {
+    for (const subscriber of this.traceSubscribers.get(event.runId) ?? []) {
+      try {
+        subscriber(event);
+      } catch {
+        // A disconnected observer must never change the Agent run outcome.
+      }
     }
   }
 
   private async appendWorkspaceTraces(
     workspacePath: string,
     before: WorkspaceSnapshot | null,
-    events: RunnerTraceEvent[],
+    runId: string,
+    agentId: string,
+    parentSpanId: string | null,
+    events: TraceEvent[],
   ): Promise<void> {
     if (!before) return;
     try {
@@ -635,14 +745,14 @@ export class AgentService {
           (event) => event.type === "file.changed" && event.summary.includes(containerPath),
         );
         if (alreadyReported) continue;
-        events.push({
+        this.captureRunnerTrace(runId, agentId, parentSpanId, {
           type: "file.changed",
           status: "success",
           timestamp: new Date(change.timestampMs).toISOString(),
           durationMs: null,
           summary: "Workspace file " + change.kind + ": " + containerPath,
           error: null,
-        });
+        }, events);
       }
     } catch {
       // Observability must not change the outcome of the Agent run.
@@ -651,14 +761,16 @@ export class AgentService {
 
   private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
     const startedAt = now();
-    const runnerTraces: RunnerTraceEvent[] = [];
+    const runnerTraces: TraceEvent[] = [];
+    let runtimeSpanId: string | null = null;
+    let runtimeTrace: TraceEvent | null = null;
     let workspaceBefore: WorkspaceSnapshot | null = null;
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
         storedRun.status = "running";
         storedRun.startedAt = startedAt;
-        this.addTrace(database, {
+        runtimeTrace = this.addTrace(database, {
           runId: run.id,
           agentId: agentAtStart.id,
           type: "runtime.started",
@@ -667,8 +779,10 @@ export class AgentService {
           summary: "Agent Runtime execution started",
           error: null,
         });
+        runtimeSpanId = runtimeTrace.spanId;
       }
     });
+    if (runtimeTrace) this.notifyTrace(runtimeTrace);
     try {
       workspaceBefore = await this.workspaces.snapshot(agentAtStart.workspacePath);
     } catch {
@@ -683,14 +797,25 @@ export class AgentService {
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
-        onTrace: (event) => runnerTraces.push(event),
+        onTrace: (event) =>
+          this.captureRunnerTrace(
+            run.id,
+            agentAtStart.id,
+            runtimeSpanId,
+            event,
+            runnerTraces,
+          ),
       });
       await this.appendWorkspaceTraces(
         agentAtStart.workspacePath,
         workspaceBefore,
+        run.id,
+        agentAtStart.id,
+        runtimeSpanId,
         runnerTraces,
       );
       const completedAt = now();
+      let completedTrace: TraceEvent | null = null;
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -699,8 +824,8 @@ export class AgentService {
         storedRun.output = this.redactText(result.output);
         storedRun.usage = result.usage;
         storedRun.completedAt = completedAt;
-        this.addRunnerTraces(database, run.id, agent.id, runnerTraces);
-        this.addTrace(database, {
+        this.addRunnerTraces(database, runnerTraces);
+        completedTrace = this.addTrace(database, {
           runId: run.id,
           agentId: agent.id,
           type: "run.completed",
@@ -722,15 +847,24 @@ export class AgentService {
         agent.lastError = null;
         agent.updatedAt = completedAt;
       });
+      this.liveTraces.delete(run.id);
+      if (completedTrace) this.notifyTrace(completedTrace);
+      await this.traceJournal.complete(run.id).catch((error: unknown) => {
+        console.error("Failed to clean completed Trace journal", error);
+      });
     } catch (error) {
       await this.appendWorkspaceTraces(
         agentAtStart.workspacePath,
         workspaceBefore,
+        run.id,
+        agentAtStart.id,
+        runtimeSpanId,
         runnerTraces,
       );
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
       const message = this.redactText(error instanceof Error ? error.message : String(error));
+      let completedTrace: TraceEvent | null = null;
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -738,13 +872,8 @@ export class AgentService {
           storedRun.status = cancelled ? "cancelled" : "failed";
           storedRun.error = message;
           storedRun.completedAt = completedAt;
-          this.addRunnerTraces(
-            database,
-            run.id,
-            agentAtStart.id,
-            runnerTraces,
-          );
-          this.addTrace(database, {
+          this.addRunnerTraces(database, runnerTraces);
+          completedTrace = this.addTrace(database, {
             runId: run.id,
             agentId: agentAtStart.id,
             type: cancelled ? "run.cancelled" : "run.failed",
@@ -763,6 +892,11 @@ export class AgentService {
           agent.lastError = cancelled ? null : message;
           agent.updatedAt = completedAt;
         }
+      });
+      this.liveTraces.delete(run.id);
+      if (completedTrace) this.notifyTrace(completedTrace);
+      await this.traceJournal.complete(run.id).catch((journalError: unknown) => {
+        console.error("Failed to clean completed Trace journal", journalError);
       });
     }
   }

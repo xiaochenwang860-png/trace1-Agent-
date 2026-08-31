@@ -83,8 +83,13 @@ export interface AgentRun {
 export type TraceEventType =
   | "run.started"
   | "runtime.started"
+  | "attempt.started"
+  | "attempt.completed"
+  | "attempt.failed"
+  | "retry.scheduled"
   | "model.requested"
   | "model.completed"
+  | "model.failed"
   | "tool.started"
   | "tool.completed"
   | "tool.failed"
@@ -100,6 +105,7 @@ export interface TraceEvent {
   traceId: string;
   spanId: string;
   parentSpanId: string | null;
+  sequence: number;
   runId: string;
   agentId: string;
   type: TraceEventType;
@@ -108,6 +114,13 @@ export interface TraceEvent {
   durationMs: number | null;
   summary: string;
   error: string | null;
+  attemptId?: string;
+  attemptNumber?: number;
+  retryOfAttemptId?: string | null;
+  nextAttemptId?: string;
+  retryDelayMs?: number;
+  errorCode?: string;
+  retryable?: boolean;
 }
 
 export interface SystemInfo {

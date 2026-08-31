@@ -70,13 +70,14 @@ describe("JsonStore", () => {
     const traces = store.snapshot().traces;
 
     expect(store.snapshot()).toMatchObject({
-      version: 3,
+      version: 4,
       users: [{ id: "local-user", name: "Local User" }],
       credentials: [],
       authSessions: [],
     });
 
     expect(traces.map((event) => event.traceId)).toEqual(["run-1", "run-1", "run-1"]);
+    expect(traces.map((event) => event.sequence)).toEqual([1, 2, 3]);
     expect(traces[0]).toMatchObject({ spanId: "root-event", parentSpanId: null });
     expect(traces[1]).toMatchObject({
       spanId: "runtime-event",

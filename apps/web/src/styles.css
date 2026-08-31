@@ -1708,6 +1708,53 @@ textarea:focus {
   background: #eeece6;
 }
 
+.trace-live-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 9px;
+  padding: 9px 11px;
+  border: 1px solid #cfe5dc;
+  border-radius: 8px;
+  background: #f2faf6;
+}
+
+.trace-live-step > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.trace-live-step strong {
+  overflow: hidden;
+  color: #365d4d;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-live-step code {
+  color: #6b8178;
+  font-size: 9px;
+}
+
+.trace-live-pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #48a77e;
+  box-shadow: 0 0 0 4px rgba(72, 167, 126, 0.14);
+  animation: pulse 1.2s infinite;
+}
+
+.trace-live-duration {
+  color: #2f6b52;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
 .trace-toolbar {
   display: flex;
   flex-wrap: wrap;

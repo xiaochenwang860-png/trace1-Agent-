@@ -263,6 +263,7 @@ export default function App() {
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  const [traceClock, setTraceClock] = useState(() => Date.now());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
@@ -424,7 +425,11 @@ export default function App() {
     const result = developerView
       ? await api.developerTrace(runId)
       : await api.trace(runId);
-    if (mountedRef.current && selectedIdRef.current === agentId) {
+    if (
+      mountedRef.current &&
+      selectedIdRef.current === agentId &&
+      activeRunRef.current?.id === runId
+    ) {
       setTraces(result.traces);
     }
   }, [developerView]);
@@ -553,6 +558,7 @@ export default function App() {
       .then((nextRuns) => {
         if (selectedIdRef.current !== selectedId) return;
         const latest = nextRuns[0] ?? null;
+        activeRunRef.current = latest;
         setActiveRun(latest);
         if (latest && developerView && developerAccess) {
           void refreshTrace(latest.id, selectedId).catch((reason) =>
@@ -569,6 +575,73 @@ export default function App() {
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
   }, [developerAccess, developerView, refreshMessages, refreshRuns, refreshTrace, selectedId]);
+
+  useEffect(() => {
+    if (
+      !developerView ||
+      !developerAccess ||
+      !selectedId ||
+      !activeRun ||
+      !["queued", "running"].includes(activeRun.status)
+    ) {
+      return;
+    }
+    const runId = activeRun.id;
+    const agentId = selectedId;
+    const controller = new AbortController();
+    void api
+      .streamDeveloperTrace(
+        runId,
+        (message) => {
+          if (
+            controller.signal.aborted ||
+            selectedIdRef.current !== agentId ||
+            activeRunRef.current?.id !== runId
+          ) {
+            return;
+          }
+          if (message.type === "snapshot") {
+            setTraces(
+              message.traces
+                .filter((event) => event.runId === runId && event.traceId === runId)
+                .sort((left, right) => left.sequence - right.sequence),
+            );
+            return;
+          }
+          if (message.event.runId !== runId || message.event.traceId !== runId) return;
+          setTraces((current) => {
+            const byId = new Map(
+              [...current, message.event].map((event) => [event.id, event]),
+            );
+            return [...byId.values()].sort(
+              (left, right) =>
+                left.sequence - right.sequence ||
+                left.timestamp.localeCompare(right.timestamp),
+            );
+          });
+        },
+        controller.signal,
+      )
+      .catch((reason) => {
+        if (!controller.signal.aborted) {
+          setDeveloperError(reason instanceof Error ? reason.message : String(reason));
+        }
+      });
+    return () => controller.abort();
+  }, [activeRun?.id, activeRun?.status, developerAccess, developerView, selectedId]);
+
+  useEffect(() => {
+    if (
+      !developerView ||
+      !activeRun ||
+      !["queued", "running"].includes(activeRun.status)
+    ) {
+      return;
+    }
+    setTraceClock(Date.now());
+    const timer = window.setInterval(() => setTraceClock(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [activeRun?.id, activeRun?.status, developerView]);
 
   useEffect(() => {
     if (!developerView || !developerAccess || !selectedId) return;
@@ -589,6 +662,7 @@ export default function App() {
 
         let displayedRun = current;
         if (latest && shouldFollowLatest) {
+          if (current?.id !== latest.id) setTraces([]);
           displayedRun = latest;
           followLatestRunRef.current = true;
           activeRunRef.current = latest;
@@ -602,9 +676,9 @@ export default function App() {
           }
         }
 
-        if (displayedRun) {
+        if (displayedRun && !["queued", "running"].includes(displayedRun.status)) {
           await refreshTrace(displayedRun.id, selectedId);
-        } else {
+        } else if (!displayedRun) {
           setTraces([]);
         }
         await Promise.all([
@@ -817,6 +891,7 @@ export default function App() {
     followLatestRunRef.current = run.id === latestRunIdRef.current;
     activeRunRef.current = run;
     setActiveRun(run);
+    setTraces([]);
     setTraceFilter("all");
     setExpandedTraceIds(new Set());
     setError(null);
@@ -861,17 +936,87 @@ export default function App() {
     if (traceFilter === "all") return traces;
     return traces.filter((event) => {
       if (traceFilter === "error") return event.status === "error";
-      if (traceFilter === "lifecycle") return event.type.startsWith("run.") || event.type === "runtime.started";
+      if (traceFilter === "lifecycle") {
+        return (
+          event.type.startsWith("run.") ||
+          event.type.startsWith("attempt.") ||
+          event.type.startsWith("retry.") ||
+          event.type === "runtime.started"
+        );
+      }
       if (traceFilter === "model") return event.type.startsWith("model.");
       if (traceFilter === "tool") return event.type.startsWith("tool.");
       return event.type === "file.changed";
     });
   }, [traceFilter, traces]);
 
+  const currentTraceStep = useMemo(() => {
+    if (!activeRun || !["queued", "running"].includes(activeRun.status)) return null;
+    let runtime: TraceEvent | null = null;
+    let terminal = false;
+    let scheduledRetry: TraceEvent | null = null;
+    const attempts = new Map<string, TraceEvent>();
+    const models = new Map<string, TraceEvent>();
+    const tools = new Map<string, TraceEvent>();
+    const ordered = [...traces].sort((left, right) => left.sequence - right.sequence);
+    for (const event of ordered) {
+      if (event.type === "runtime.started") runtime = event;
+      if (event.type === "attempt.started") {
+        attempts.set(event.spanId, event);
+        scheduledRetry = null;
+      }
+      if (event.type === "attempt.completed" || event.type === "attempt.failed") {
+        attempts.delete(event.spanId);
+      }
+      if (event.type === "retry.scheduled") scheduledRetry = event;
+      if (event.type === "model.requested") models.set(event.spanId, event);
+      if (event.type === "model.completed" || event.type === "model.failed") {
+        models.delete(event.spanId);
+      }
+      if (event.type === "tool.started") tools.set(event.spanId, event);
+      if (event.type === "tool.completed" || event.type === "tool.failed") {
+        tools.delete(event.spanId);
+      }
+      if (["run.completed", "run.failed", "run.cancelled"].includes(event.type)) {
+        terminal = true;
+        runtime = null;
+        scheduledRetry = null;
+        attempts.clear();
+        models.clear();
+        tools.clear();
+      }
+    }
+    if (terminal) return null;
+    const latest = (events: Iterable<TraceEvent>) =>
+      [...events].sort((left, right) => left.sequence - right.sequence).at(-1) ?? null;
+    return (
+      latest(tools.values()) ??
+      latest(models.values()) ??
+      scheduledRetry ??
+      latest(attempts.values()) ??
+      runtime ??
+      ordered.at(-1) ??
+      null
+    );
+  }, [activeRun, traces]);
+
+  const currentTraceDuration = currentTraceStep
+    ? Math.max(0, traceClock - Date.parse(currentTraceStep.timestamp))
+    : null;
+
   const firstTraceError = traces.find((event) => event.status === "error");
   const traceDiagnosis = firstTraceError
     ? diagnoseTraceError(firstTraceError.error ?? firstTraceError.summary)
     : null;
+  const failureRecoveredByRetry = Boolean(
+    firstTraceError?.attemptId &&
+      activeRun?.status === "completed" &&
+      traces.some(
+        (event) =>
+          event.type === "attempt.completed" &&
+          event.sequence > firstTraceError.sequence,
+      ),
+  );
 
   const agentRunMaximum = useMemo(
     () => Math.max(1, ...(developerAnalytics?.agents.map((agent) => agent.runCount) ?? [0])),
@@ -880,12 +1025,14 @@ export default function App() {
 
   const traceWaterfall = useMemo(() => {
     if (traces.length === 0) return [];
-    const sortedEvents = [...traces].sort((left, right) =>
-      left.timestamp.localeCompare(right.timestamp),
+    const sortedEvents = [...traces].sort(
+      (left, right) => left.sequence - right.sequence || left.timestamp.localeCompare(right.timestamp),
     );
     const startFor = (event: TraceEvent): number => {
       const startType =
-        event.type === "model.completed"
+        event.type === "attempt.completed" || event.type === "attempt.failed"
+          ? "attempt.started"
+          : event.type === "model.completed" || event.type === "model.failed"
           ? "model.requested"
           : event.type === "tool.completed" || event.type === "tool.failed"
             ? "tool.started"
@@ -893,6 +1040,10 @@ export default function App() {
               ? "run.started"
               : null;
       if (!startType) return Date.parse(event.timestamp);
+      const matchingSpan = sortedEvents.find(
+        (candidate) => candidate.type === startType && candidate.spanId === event.spanId,
+      );
+      if (matchingSpan) return Date.parse(matchingSpan.timestamp);
       const preceding = [...sortedEvents]
         .reverse()
         .find((candidate) => candidate.type === startType && candidate.timestamp <= event.timestamp);
@@ -900,7 +1051,11 @@ export default function App() {
     };
     const visualEvents = sortedEvents.filter((event) =>
       [
+        "attempt.completed",
+        "attempt.failed",
+        "retry.scheduled",
         "model.completed",
+        "model.failed",
         "tool.completed",
         "tool.failed",
         "file.changed",
@@ -2101,6 +2256,19 @@ export default function App() {
                       )}
                     </div>
                   </div>
+                  {currentTraceStep && (
+                    <section className="trace-live-step" aria-live="polite">
+                      <span className="trace-live-pulse" aria-hidden="true" />
+                      <div>
+                        <span className="eyebrow">Executing now</span>
+                        <strong>{currentTraceStep.summary}</strong>
+                        <code>{currentTraceStep.type}</code>
+                      </div>
+                      <span className="trace-live-duration">
+                        {formatDuration(currentTraceDuration)}
+                      </span>
+                    </section>
+                  )}
                   <div className="trace-toolbar">
                     <label>
                       Run
@@ -2197,7 +2365,9 @@ export default function App() {
                   )}
                   {firstTraceError && traceDiagnosis && (
                     <aside className="trace-diagnostic" role="alert">
-                      <strong>Failure detected: {firstTraceError.type}</strong>
+                      <strong>
+                        {failureRecoveredByRetry ? "Recovered retry" : "Failure detected"}: {firstTraceError.type}
+                      </strong>
                       <span>{firstTraceError.error ?? firstTraceError.summary}</span>
                       <div className="trace-diagnosis">
                         <span className="eyebrow">Suggested diagnosis</span>
@@ -2300,6 +2470,43 @@ export default function App() {
                                     <dt>Event ID</dt>
                                     <dd><code>{event.id}</code></dd>
                                   </div>
+                                  {event.attemptId && (
+                                    <div className="trace-detail-wide">
+                                      <dt>Attempt</dt>
+                                      <dd>
+                                        #{event.attemptNumber ?? "?"} · <code>{event.attemptId}</code>
+                                      </dd>
+                                    </div>
+                                  )}
+                                  {event.retryOfAttemptId && (
+                                    <div className="trace-detail-wide">
+                                      <dt>Retry of attempt</dt>
+                                      <dd><code>{event.retryOfAttemptId}</code></dd>
+                                    </div>
+                                  )}
+                                  {event.nextAttemptId && (
+                                    <div className="trace-detail-wide">
+                                      <dt>Next attempt</dt>
+                                      <dd>
+                                        <code>{event.nextAttemptId}</code>
+                                        {event.retryDelayMs !== undefined
+                                          ? ` after ${formatDuration(event.retryDelayMs)}`
+                                          : ""}
+                                      </dd>
+                                    </div>
+                                  )}
+                                  {event.errorCode && (
+                                    <div>
+                                      <dt>Error code</dt>
+                                      <dd><code>{event.errorCode}</code></dd>
+                                    </div>
+                                  )}
+                                  {event.retryable !== undefined && (
+                                    <div>
+                                      <dt>Retryable</dt>
+                                      <dd>{event.retryable ? "yes" : "no"}</dd>
+                                    </div>
+                                  )}
                                   {event.error && (
                                     <div className="trace-detail-wide trace-detail-error">
                                       <dt>Error</dt>

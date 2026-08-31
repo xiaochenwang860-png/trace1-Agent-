@@ -208,6 +208,71 @@ export async function createApp(
     };
   });
 
+  app.get("/api/developer/runs/:id/stream", async (request, reply) => {
+    const denied = requireDeveloper(request, reply);
+    if (denied) return denied;
+    const { id } = runIdParams.parse(request.params);
+    service.getRun(id);
+    const sanitize = (event: ReturnType<AgentService["getTrace"]>[number]) => ({
+      ...event,
+      summary: redactText(event.summary),
+      error: redactValue(event.error),
+    });
+
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Content-Type-Options": "nosniff",
+    });
+
+    let closed = false;
+    let snapshotSent = false;
+    const sentEventIds = new Set<string>();
+    const pending: ReturnType<AgentService["getTrace"]> = [];
+    const write = (value: unknown) => {
+      if (!closed && !reply.raw.destroyed) {
+        reply.raw.write(JSON.stringify(value) + "\n");
+      }
+    };
+    const unsubscribe = service.subscribeToTrace(id, (event) => {
+      if (!snapshotSent) {
+        pending.push(event);
+        return;
+      }
+      if (sentEventIds.has(event.id)) return;
+      sentEventIds.add(event.id);
+      write({ type: "trace", event: sanitize(event) });
+      if (["run.completed", "run.failed", "run.cancelled"].includes(event.type)) {
+        closed = true;
+        unsubscribe();
+        reply.raw.end();
+      }
+    });
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      unsubscribe();
+    };
+    reply.raw.once("close", close);
+
+    const snapshot = service.getTrace(id);
+    for (const event of snapshot) sentEventIds.add(event.id);
+    write({ type: "snapshot", traces: snapshot.map(sanitize) });
+    snapshotSent = true;
+    for (const event of pending) {
+      if (sentEventIds.has(event.id)) continue;
+      sentEventIds.add(event.id);
+      write({ type: "trace", event: sanitize(event) });
+    }
+    if (!["queued", "running"].includes(service.getRun(id).status) && !closed) {
+      close();
+      reply.raw.end();
+    }
+    return reply;
+  });
+
   app.get("/api/system", async () => service.systemInfo());
 
   app.get("/api/agents", async (request) => ({
