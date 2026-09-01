@@ -12,7 +12,8 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 FROM ${NODE_IMAGE} AS runtime
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    GIT_BIN=/usr/bin/git
 WORKDIR /app
 
 ARG DEBIAN_MIRROR=""
@@ -30,6 +31,11 @@ RUN if [ -n "$DEBIAN_SECURITY_MIRROR" ]; then \
     && apt-get install -y --no-install-recommends ca-certificates git ripgrep \
     && npm install --global @openai/codex@0.111.0 \
     && codex --version \
+    && git --version \
+    && git init --bare --object-format=sha256 --quiet /tmp/launchpad-git-sha256-probe.git \
+    && git --git-dir=/tmp/launchpad-git-sha256-probe.git rev-parse --is-bare-repository | grep -qx true \
+    && git --git-dir=/tmp/launchpad-git-sha256-probe.git rev-parse --show-object-format=storage | grep -qx sha256 \
+    && rm -rf /tmp/launchpad-git-sha256-probe.git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/node_modules ./node_modules

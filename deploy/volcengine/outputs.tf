@@ -12,3 +12,8 @@ output "app_url" {
   description = "Agent Launchpad URL. Wait for cloud-init to finish before opening it."
   value       = "http://${volcenginecc_ecs_instance.launchpad.eip_address.ip_address}"
 }
+
+output "recovery_operator_id" {
+  description = "Stable identity recorded for Developer Console recovery operations."
+  value       = var.recovery_operator_id
+}

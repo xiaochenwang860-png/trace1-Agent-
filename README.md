@@ -35,10 +35,13 @@
 - Agent 在容器隔离的工作区中执行任务
 - 使用 Codex CLI 处理文件、代码和命令行任务
 - 与 Agent 的多轮对话和运行记录保存
+- 每次 Run 执行前后在 Agent 外置 Git SHA-256 仓库中生成完整工作区检查点与新增、修改、删除摘要
+- 用户可在自己的 Run 中选择文件或目录，先预演冲突，再恢复误删或误改内容
 
 ### Glass Box 开发者控制台
 
 - 使用单独的 `TRACE_VIEWER_TOKEN` 保护开发者入口
+- `TRACE_VIEWER_TOKEN` 只允许查看和恢复预演；实际跨用户恢复还需要独立的 `RECOVERY_OPERATOR_TOKEN`
 - 登录后只需验证一次；随后可在控制台内切换用户、Agent 和运行记录
 - 总览所有注册用户、Agent 数量、运行总数和失败数量
 - 支持按用户名、Agent、状态或 Run ID 搜索
@@ -46,7 +49,7 @@
 - 点击 Agent 查看其运行记录与完整 Trace
 - 点击单次运行查看事件卡片、时间线、Token 用量与诊断信息
 - 支持 JSON 导出，便于比赛展示或后续接入分析系统
-- 页面自动轮询更新，新的运行和错误会自动出现
+- Developer 运行中优先使用 NDJSON Trace stream，断线后由轮询补齐历史
 
 ### Trace / 审计事件
 
@@ -56,17 +59,20 @@
 | --- | --- |
 | `run.started` | 平台接收任务并创建运行记录 |
 | `runtime.started` | Agent 容器运行环境开始执行 |
-| `attempt.started` | 一次执行尝试开始，并标记尝试序号与目标 |
-| `attempt.completed` | 当前执行尝试成功完成 |
-| `attempt.failed` | 当前执行尝试失败并记录错误分类 |
-| `retry.scheduled` | 调用方已经安排下一次重试及其等待时间 |
+| `attempt.started` / `attempt.completed` | 一次 Runner Attempt 的开始与成功结束 |
+| `attempt.failed` | 一次 Attempt 失败，包含 `errorCode` 和 `retryable` |
+| `retry.scheduled` | 为后续 Fallback 策略预留的重试关系 |
 | `model.requested` | Codex 模型回合开始 |
 | `model.completed` | Codex 模型回合完成 |
-| `model.failed` | Codex 模型回合失败 |
+| `model.failed` | Codex 模型回合报告错误 |
 | `tool.started` | Agent 开始调用工具或命令 |
 | `tool.completed` | 工具或命令执行成功 |
 | `tool.failed` | 工具或命令执行失败 |
 | `file.changed` | Agent 在隔离工作区创建、修改或删除文件 |
+| `workspace.checkpoint.created` | Agent 执行前的可恢复工作区检查点已持久化 |
+| `workspace.diff.generated` | 已生成 Run 前后的结构和内容差异 |
+| `workspace.restore.started` | 用户或恢复操作员开始应用已预演的恢复 |
+| `workspace.restore.completed` | 工作区已恢复并通过根哈希校验 |
 | `run.completed` | 整个 Agent 运行完成 |
 | `run.failed` | 运行失败并记录诊断信息 |
 | `run.cancelled` | 运行被取消 |
@@ -79,12 +85,32 @@
 - **Duration**：事件或运行耗时。
 - **Token usage**：输入、缓存输入和输出 Token 的统计。
 
+### 工作区恢复
+
+恢复历史保存在每个 Agent 独立的外置 bare Git SHA-256 仓库中，工作区内不会创建平台 `.git`，Agent 因而无法删除或篡改检查点。后端通过 `hash-object --no-filters`、`mktree`、`commit-tree`、`update-ref` 和 `cat-file` 读写 Git 对象；补充 Manifest 记录 Git tree 本身无法完整表达的空目录、完整 mode、裸内容哈希与 Git blob OID。
+
+用户从 Run 历史中选择不可变的 commit OID，并先查看 created / modified / deleted 摘要和冲突预演。选择性恢复会合并 Manifest，在旁路目录中重建并校验完整结果，再通过安全快照、quarantine 和持久化事务日志发布，不会对活工作区执行 `git reset --hard`。服务在恢复中途重启时，会根据日志和工作区根哈希证明已发布状态或回滚；无法证明状态时会阻止继续操作。
+
+恢复只覆盖平台管理的 Agent 工作区。外部 API、数据库、邮件等副作用以及已经消耗的 Token 无法回滚。完整边界见 [Workspace Recovery](docs/WORKSPACE_RECOVERY.md)。
+
+### Dev-vale Trace and Git integration
+
+This integrated tree keeps the recovery baseline and adds the dev-vale glass-box path:
+
+- Runner events are assigned stable `sequence`, `attemptId`, and operation/span IDs.
+- The developer console can consume `GET /api/developer/runs/:id/stream` as NDJSON while a run is active.
+- In-flight events are appended to `APP_DATA_DIR/trace-journal/<runId>.ndjson`; startup recovery merges them into the JSON store and removes the journal after terminal persistence.
+- Every run creates a Git SHA-256 checkpoint before execution and a post-run snapshot for diff/restore. Recovery remains selective, previewed, idempotent, and does not run `git reset --hard` in the Agent workspace.
+- Windows startup resolves `GIT_BIN` from an explicit path, PATH, Git for Windows, or `MinGit-*`. Direct `npm run dev` startup uses the same resolver.
+
+`AttemptTrace` is wired around the real Runner for one observable Attempt per run. It records attempt start/completion/failure and keeps retry metadata extensible; automatic retry is intentionally not enabled until an idempotent fallback policy is configured.
+
 ### 数据安全与脱敏
 
 - API Key、Bearer Token、密码和常见密钥格式会在保存、展示、错误输出和日志中脱敏。
 - Agent 指令、完整提示词、模型输出、工作区路径等敏感字段不会通过开发者总览 API 全量暴露。
 - 用户密码采用加盐哈希保存；会话标识采用哈希处理。
-- `.env`、本地数据、工作区、Codex 运行目录、依赖目录等已排除在 Git 版本控制之外。
+- `.env`、本地数据、工作区、Codex 运行目录、依赖目录等已排除在本项目源码仓库之外；恢复检查点策略独立，可能包含 Agent 工作区中的敏感内容。
 - 这是比赛 POC，若投入生产，仍应增加 HTTPS、权限体系、数据库加密、审计保留策略、速率限制和集中式日志服务。
 
 ## 3. 系统架构
@@ -96,6 +122,8 @@ flowchart LR
   W --> API[Fastify Server]
   C --> API
   API --> S[(本地状态存储)]
+  API --> G[(每 Agent 外置 bare Git<br/>SHA-256 checkpoints)]
+  API --> J[Staging / Quarantine<br/>恢复事务日志]
   API --> R[Container Runtime]
   R --> X[Codex CLI]
   X --> A[ModelArk Responses API]
@@ -124,12 +152,13 @@ CodeJam/
 
 1. macOS 或 Linux。
 2. Node.js **22 或以上**，npm **10 或以上**。
-3. 一个已启动的容器引擎：Docker Desktop、Colima 或 Podman 三选一。
-4. BytePlus / ModelArk 的：
+3. 控制平面可用的 Git **2.29 或以上**，且支持 SHA-256 对象格式。
+4. 一个已启动的容器引擎：Docker Desktop、Colima 或 Podman 三选一。
+5. BytePlus / ModelArk 的：
    - `ARK_API_KEY`：ModelArk API Key；
    - `ARK_MODEL`：已激活模型的 Endpoint / Model ID；
    - 正确的服务区域 URL（以 ModelArk 控制台生成的调用示例为准）。
-5. 一个你自己设置的开发者控制台密码：`TRACE_VIEWER_TOKEN`。
+6. 一个你自己设置的开发者控制台密码：`TRACE_VIEWER_TOKEN`。
 
 检查本机环境：
 
@@ -141,6 +170,8 @@ docker --version
 ```
 
 > Docker Desktop 必须处于运行状态；若 Docker 没启动，`npm run poc` 会提示找不到容器引擎。
+>
+> 启动时会用临时 bare 仓库实际探测 `--object-format=sha256`，而不只检查版本字符串。需要指定 Git 路径时设置 `GIT_BIN`。
 
 ## 6. 从零运行
 
@@ -231,10 +262,13 @@ Developer console: http://localhost:3000/developer
 | 命令 | 用途 |
 | --- | --- |
 | `npm run poc` | 一键构建并启动本地容器 POC |
+| `npm run poc:windows` | Windows PowerShell 本地启动，安全输入 Ark Key 并检查 Git/Codex |
 | `npm run dev` | 前后端开发模式 |
 | `npm run build` | 构建前端与后端 |
 | `npm run typecheck` | TypeScript 类型检查 |
 | `npm run test` | 运行后端测试 |
+| `npm run test:matrix` | 运行实时 Trace 演示矩阵测试 |
+| `npm run demo:matrix` | 执行实时 Trace 演示矩阵 |
 | `npm run check` | 依次运行类型检查、测试和构建 |
 | `npm run start` | 启动已构建的后端服务 |
 
@@ -255,6 +289,7 @@ Developer console: http://localhost:3000/developer
 | `ARK_API_KEY and ARK_MODEL are required` | 当前终端没有设置环境变量 | 重新按第 6.2 节输入并导出变量 |
 | `401 Unauthorized` | Key 无效、复制不完整，或 Key/模型与区域不匹配 | 在 ModelArk 控制台重新生成/复制 Key，并使用正确 `ARK_BASE_URL` |
 | 开发者页面提示 token 无效 | 输入的密码与启动时 `TRACE_VIEWER_TOKEN` 不同 | 停止服务后重新设置 token 再启动 |
+| Git 恢复能力探测失败 | Git 缺失、低于 2.29，或不支持 SHA-256 对象格式 | 安装兼容版本，或将 `GIT_BIN` 指向对应可执行文件 |
 | 刷新页面后服务无法访问 | 启动服务的终端已关闭 | 按第 6.2 节重新启动 `npm run poc` |
 
 ## 10. 测试与提交前检查
@@ -270,7 +305,23 @@ git status
 
 - 测试、类型检查和构建全部通过；
 - 没有提交 `.env`、真实 Key、开发者控制台密码、本地数据或工作区文件；
-- README 中的仓库地址、截图和演示步骤符合当前版本；
+- README 中的仓库地址、截图和演示步骤符合当前版本。
+
+## 11. 可选离线打包
+
+在项目上一级目录执行：
+
+```bash
+cd ..
+zip -r CodeJam-release.zip CodeJam \
+  -x "CodeJam/node_modules/*" \
+     "CodeJam/.git/*" \
+     "CodeJam/.env" \
+     "CodeJam/.data/*" \
+     "CodeJam/.local/*"
+```
+
+建议优先通过 GitHub 分发源码，并为每个运行环境单独配置 ModelArk Key 和开发者控制台密码。
 
 ---
 
@@ -301,9 +352,12 @@ Users can only access their own Agents. Authorized developers can drill down fro
 - Global overview of users, Agents, runs, and failed runs.
 - Search by user, Agent, run status, or Run ID.
 - User, Agent, run, and trace drill-down pages.
-- Automatic refresh for new execution activity.
+- NDJSON live Trace stream for active Developer runs, with polling fallback after reconnect.
 - JSON export for demos and downstream analysis.
 - Trace waterfall timeline, event cards, file changes, tool calls, token usage, and diagnostics.
+- Per-Agent external bare Git SHA-256 checkpoints before and after every Run, with created, modified, and deleted path summaries.
+- Owner and operator recovery UI with selective restore, conflict preview, safety snapshots, and crash reconciliation.
+- Read-only `TRACE_VIEWER_TOKEN` separated from the destructive `RECOVERY_OPERATOR_TOKEN`.
 - Sensitive-data redaction for credentials, prompts, outputs, errors, and telemetry fields.
 
 ## 3. Trace Events
@@ -315,8 +369,10 @@ run.started       runtime.started     attempt.started
 attempt.completed attempt.failed      retry.scheduled
 model.requested   model.completed     model.failed
 tool.started      tool.completed      tool.failed
-file.changed      run.completed       run.failed
-run.cancelled
+tool.failed       file.changed        workspace.checkpoint.created
+workspace.diff.generated              workspace.restore.started
+workspace.restore.completed           workspace.restore.blocked
+run.completed     run.failed          run.cancelled
 ```
 
 Every event is correlated through stable **Trace ID**, **Span ID**, and **Parent Span ID** values. In this POC, the Trace ID normally maps to the run.
@@ -325,6 +381,7 @@ Every event is correlated through stable **Trace ID**, **Span ID**, and **Parent
 
 - macOS or Linux
 - Node.js 22+ and npm 10+
+- Git 2.29+ on the control-plane host, with SHA-256 object-format support
 - One running container engine: Docker Desktop, Colima, or Podman
 - A BytePlus / ModelArk API key
 - An activated ModelArk Endpoint / Model ID
@@ -394,11 +451,30 @@ Do not retry and do not change files. Explain the tool result.
 
 The developer console should display a `tool.failed` event and the non-zero exit code.
 
+To demonstrate recovery, first create a file in one Run, then ask the Agent to
+delete it in a later Run. Open that Run's **Workspace recovery** panel, select
+the checkpoint commit and deleted path, review the created/modified/deleted
+summary, preview the restore, and apply it. A regular user can restore their own
+Run directly. A cross-user Developer Console restore additionally requires the
+`RECOVERY_OPERATOR_TOKEN` printed by the local POC startup script.
+
+Recovery metadata is stored in a separate bare repository for each Agent. The
+Agent workspace contains no platform `.git` directory. Selective restore reads
+objects from Git, builds and verifies a complete sibling staging workspace, and
+publishes it with a durable quarantine journal; it never runs `reset --hard`
+against the live workspace.
+
+On Windows, `GIT_BIN` may point to either Git for Windows or a MinGit
+`cmd\git.exe`. When unset, the launcher and the server scan PATH plus common
+`Git` and `MinGit-*` installation directories. Recovery only uses local Git
+plumbing commands, so MinGit does not need remote helpers.
+
 ## 7. Development and Verification
 
 | Command | Purpose |
 | --- | --- |
 | `npm run poc` | Build and run the local container POC |
+| `npm run poc:windows` | Start the guarded Windows local-process profile |
 | `npm run dev` | Start development mode |
 | `npm run build` | Build web and server packages |
 | `npm run typecheck` | Run TypeScript checks |
@@ -418,7 +494,9 @@ git status
 - Credentials and common secret formats are redacted before persistence and telemetry display.
 - User passwords and sessions are stored as hashes, not plaintext.
 - Developer APIs do not return full Agent instructions, workspaces, raw prompts, or complete model outputs in overview views.
-- `.env`, local state, workspaces, runtime directories, and dependencies are ignored by Git.
+- Recovery Git repositories contain complete workspace content and must be stored on restricted, encrypted storage with an explicit retention policy.
+- This POC supports one control-plane process; its workspace locks and preview leases are not distributed locks.
+- `.env`, local state, workspaces, runtime directories, and dependencies are ignored by the project's source-control repository. Recovery checkpoint policy is separate and may capture sensitive workspace content.
 - This repository is a hackathon POC. Production deployment should add HTTPS, role-based access control, database encryption, rate limiting, retention policies, and centralized logging.
 
 ## 9. Troubleshooting
@@ -431,17 +509,19 @@ git status
 | Missing `ARK_API_KEY` / `ARK_MODEL` | Variables were not set in this terminal | Repeat the Quick Start environment setup |
 | `401 Unauthorized` | Invalid key or region/model mismatch | Regenerate/copy the key and match `ARK_BASE_URL` to your ModelArk region |
 | Developer token rejected | Wrong `TRACE_VIEWER_TOKEN` | Restart the service with a new token and sign in again |
+| Git recovery capability probe failed | Git is missing, older than 2.29, or cannot create SHA-256 repositories | Install a compatible Git or set `GIT_BIN` to its executable |
 
 ## 10. Documentation and License
 
 Further references:
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Workspace recovery](docs/WORKSPACE_RECOVERY.md)
+- [Git recovery architecture](docs/GIT_RESTORE_PLAN.md)
+- [Implementation log](docs/IMPLEMENTATION_LOG.md)
 - [Local POC guide](docs/LOCAL_POC.md)
+- [API and rollback demo](docs/ROLLBACK_DEMO.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
 - [Hackathon extension guide](docs/HACKATHON_EXTENSION_GUIDE.md)
-- [Glass Box work summary](docs/GLASS_BOX_WORK_SUMMARY.md)
-- [Behavior matrix demo guide](docs/DEMO_MATRIX.md)
-- [Retry / fallback Trace contract](docs/RETRY_TRACE_CONTRACT.md)
 
 Licensed under the [MIT License](LICENSE).

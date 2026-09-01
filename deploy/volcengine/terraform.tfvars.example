@@ -11,3 +11,6 @@ allowed_ssh_cidr = "203.0.113.10/32"
 # full Terraform + cloud-init path.
 repository_url = "https://github.com/your-org/volc-agent-launchpad.git"
 repository_ref = "main"
+
+# Runtime credentials and RECOVERY_OPERATOR_ID come from .env.production via
+# scripts/deploy-volcengine.sh. Do not put secrets in this file.

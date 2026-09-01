@@ -36,6 +36,8 @@ locals {
     "LOG_LEVEL=info",
     "APP_AUTH_TOKEN=${var.app_auth_token}",
     "TRACE_VIEWER_TOKEN=${var.trace_viewer_token}",
+    "RECOVERY_OPERATOR_TOKEN=${var.recovery_operator_token}",
+    "RECOVERY_OPERATOR_ID=${var.recovery_operator_id}",
     "ARK_API_KEY=${var.ark_api_key}",
     "ARK_MODEL=${var.ark_model}",
     "ARK_BASE_URL=${var.ark_base_url}",

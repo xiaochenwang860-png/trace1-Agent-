@@ -23,6 +23,24 @@ const updateAgentBody = createAgentBody.partial().refine(
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
+const checkpointId = z.string().regex(/^[a-f0-9]{64}$/, "Invalid recovery checkpoint");
+const recoverySelection = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("all") }),
+  z.object({
+    mode: z.literal("paths"),
+    paths: z.array(z.string().min(1).max(1_024)).min(1).max(10_000),
+  }),
+]);
+const recoveryPreviewBody = z.object({
+  checkpointId,
+  selection: recoverySelection,
+});
+const recoveryRestoreBody = z.object({
+  checkpointId,
+  previewId: z.string().uuid(),
+  selection: recoverySelection,
+});
+const idempotencyKey = z.string().trim().min(8).max(200);
 const developerAnalyticsQuery = z.object({
   userId: z.string().trim().min(1).max(128),
 });
@@ -52,6 +70,7 @@ export async function createApp(
         "req.headers.authorization",
         "req.headers.cookie",
         "req.headers.x-trace-viewer-token",
+        "req.headers.x-recovery-operator-token",
       ],
     },
     bodyLimit: 1_048_576,
@@ -69,6 +88,21 @@ export async function createApp(
   const requireDeveloper = (request: FastifyRequest, reply: { code: (status: number) => { send: (body: unknown) => unknown } }) => {
     if (!developerAuthorized(request)) {
       return reply.code(403).send({ error: "Developer Trace access required" });
+    }
+  };
+
+  const recoveryOperatorAuthorized = (request: FastifyRequest): boolean => {
+    const header = request.headers["x-recovery-operator-token"];
+    const candidate = typeof header === "string" ? header : "";
+    return tokenMatches(config.recoveryOperatorToken, candidate);
+  };
+
+  const requireRecoveryOperator = (
+    request: FastifyRequest,
+    reply: { code: (status: number) => { send: (body: unknown) => unknown } },
+  ) => {
+    if (!recoveryOperatorAuthorized(request)) {
+      return reply.code(403).send({ error: "Recovery operator access required" });
     }
   };
 
@@ -149,6 +183,7 @@ export async function createApp(
     return {
       configured: config.traceViewerToken.length > 0,
       authorized: developerAuthorized(request),
+      recoveryConfigured: config.recoveryOperatorToken.length > 0,
     };
   });
 
@@ -273,6 +308,48 @@ export async function createApp(
     return reply;
   });
 
+  app.get("/api/developer/runs/:id/recovery", async (request, reply) => {
+    const denied = requireDeveloper(request, reply);
+    if (denied) return denied;
+    const { id } = runIdParams.parse(request.params);
+    return { recovery: await service.getRunRecovery(id) };
+  });
+
+  app.post("/api/developer/runs/:id/recovery/preview", async (request, reply) => {
+    const denied = requireDeveloper(request, reply);
+    if (denied) return denied;
+    const { id } = runIdParams.parse(request.params);
+    const body = recoveryPreviewBody.parse(request.body);
+    return {
+      preview: await service.previewRunRecovery(
+        id,
+        body.checkpointId,
+        body.selection,
+        { type: "developer", id: config.recoveryOperatorId },
+      ),
+    };
+  });
+
+  app.post("/api/developer/runs/:id/recovery/restore", async (request, reply) => {
+    const denied = requireDeveloper(request, reply);
+    if (denied) return denied;
+    const recoveryDenied = requireRecoveryOperator(request, reply);
+    if (recoveryDenied) return recoveryDenied;
+    const { id } = runIdParams.parse(request.params);
+    const body = recoveryRestoreBody.parse(request.body);
+    const operationKey = idempotencyKey.parse(request.headers["idempotency-key"]);
+    return {
+      operation: await service.restoreRunRecovery(
+        id,
+        body.checkpointId,
+        body.previewId,
+        body.selection,
+        operationKey,
+        { type: "developer", id: config.recoveryOperatorId },
+      ),
+    };
+  });
+
   app.get("/api/system", async () => service.systemInfo());
 
   app.get("/api/agents", async (request) => ({
@@ -333,6 +410,45 @@ export async function createApp(
     return { run: service.getRun(id, currentUser(request).id) };
   });
 
+  app.get("/api/runs/:id/recovery", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    const user = currentUser(request);
+    return { recovery: await service.getRunRecovery(id, user.id) };
+  });
+
+  app.post("/api/runs/:id/recovery/preview", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    const body = recoveryPreviewBody.parse(request.body);
+    const user = currentUser(request);
+    return {
+      preview: await service.previewRunRecovery(
+        id,
+        body.checkpointId,
+        body.selection,
+        { type: "owner", id: user.id },
+        user.id,
+      ),
+    };
+  });
+
+  app.post("/api/runs/:id/recovery/restore", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    const body = recoveryRestoreBody.parse(request.body);
+    const operationKey = idempotencyKey.parse(request.headers["idempotency-key"]);
+    const user = currentUser(request);
+    return {
+      operation: await service.restoreRunRecovery(
+        id,
+        body.checkpointId,
+        body.previewId,
+        body.selection,
+        operationKey,
+        { type: "owner", id: user.id },
+        user.id,
+      ),
+    };
+  });
+
   app.get("/api/runs/:id/trace", async (request, reply) => {
     const header = request.headers["x-trace-viewer-token"];
     const candidate = typeof header === "string" ? header : "";
@@ -383,6 +499,7 @@ export async function createApp(
     }
     return reply.code(statusCode).send({
       error: redactText(appError.message),
+      ...(error instanceof HttpError && error.payload ? error.payload : {}),
       ...(validationError ? { details: error.issues } : {}),
     });
   });

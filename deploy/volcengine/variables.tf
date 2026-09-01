@@ -85,6 +85,25 @@ variable "trace_viewer_token" {
   }
 }
 
+variable "recovery_operator_token" {
+  description = "Recovery write token, separate from the read-only trace viewer token. Supplied through TF_VAR_recovery_operator_token."
+  type        = string
+  sensitive   = true
+  validation {
+    condition     = length(var.recovery_operator_token) >= 24 && length(var.recovery_operator_token) <= 128 && can(regex("^[A-Za-z0-9._~-]+$", var.recovery_operator_token)) && !startswith(var.recovery_operator_token, "replace-")
+    error_message = "recovery_operator_token must contain 24-128 URL-safe, non-placeholder characters."
+  }
+}
+
+variable "recovery_operator_id" {
+  description = "Stable operator identity recorded in recovery audit events. Supplied through TF_VAR_recovery_operator_id."
+  type        = string
+  validation {
+    condition     = length(var.recovery_operator_id) >= 1 && length(var.recovery_operator_id) <= 64 && can(regex("^[A-Za-z0-9_.-]+$", var.recovery_operator_id))
+    error_message = "recovery_operator_id must contain 1-64 URL-safe identity characters."
+  }
+}
+
 variable "ark_model" {
   description = "Ark endpoint/model ID supporting the Responses API."
   type        = string

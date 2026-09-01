@@ -8,6 +8,7 @@ flowchart LR
     API --> Service["AgentService"]
     Service --> Store["JSON store"]
     Service --> Workspace["Agent workspace"]
+    Service --> Recovery["SHA-256 recovery store"]
     Service --> Runner{"AgentRunner"}
     Runner -->|Local POC| Container["Disposable Runtime container"]
     Runner -->|ECS| Process["Codex child process"]
@@ -45,6 +46,7 @@ Interrupted Runs become `cancelled` after a restart.
 
 ```text
 data/launchpad.json       Agent, message, and Run metadata
+data/recovery/             CAS objects, manifests, and restore journals
 workspaces/AgentID/       Agent-created files
 workspaces/.deleted/      Archived deleted workspaces
 codex-home/               Codex configuration and sessions
@@ -52,6 +54,12 @@ codex-home/               Codex configuration and sessions
 
 `JsonStore` serializes writes and atomically replaces one JSON file. It supports
 one process only.
+
+`RecoveryStore` captures complete workspace manifests and immutable SHA-256
+blobs before and after a Run. Restore requires a conflict-checked preview,
+captures a safety snapshot, and uses a durable directory-swap journal that is
+reconciled on startup. It does not invoke or require system Git. See
+[Workspace Recovery](WORKSPACE_RECOVERY.md).
 
 ### Runtime providers
 
@@ -80,3 +88,9 @@ the stored Codex thread, and escalate termination after a grace period.
 
 The current container or ECS instance is the POC trust boundary. Ordinary
 containers are not hardened multi-tenant isolation.
+
+The control plane must run as a single service process. Its JSON serialization,
+workspace mutexes, preview leases, and active execution tracking are not
+distributed coordination primitives. Recovery data contains the complete
+workspace and therefore requires restricted permissions, encrypted storage,
+retention monitoring, and deliberate cleanup.

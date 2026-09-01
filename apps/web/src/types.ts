@@ -87,6 +87,12 @@ export type TraceEventType =
   | "attempt.completed"
   | "attempt.failed"
   | "retry.scheduled"
+  | "workspace.checkpoint.created"
+  | "workspace.diff.generated"
+  | "workspace.restore.started"
+  | "workspace.restore.completed"
+  | "workspace.restore.blocked"
+  | "workspace.restore.failed"
   | "model.requested"
   | "model.completed"
   | "model.failed"
@@ -105,7 +111,6 @@ export interface TraceEvent {
   traceId: string;
   spanId: string;
   parentSpanId: string | null;
-  sequence: number;
   runId: string;
   agentId: string;
   type: TraceEventType;
@@ -114,6 +119,7 @@ export interface TraceEvent {
   durationMs: number | null;
   summary: string;
   error: string | null;
+  sequence: number;
   attemptId?: string;
   attemptNumber?: number;
   retryOfAttemptId?: string | null;
@@ -121,6 +127,82 @@ export interface TraceEvent {
   retryDelayMs?: number;
   errorCode?: string;
   retryable?: boolean;
+}
+
+export type RecoveryStatus =
+  | "available"
+  | "restored"
+  | "blocked"
+  | "unavailable";
+
+export type RecoveryFileKind = "created" | "modified" | "deleted";
+export type RestoreAction = "create" | "replace" | "delete";
+
+export interface RecoveryFile {
+  path: string;
+  kind: RecoveryFileKind;
+  beforeHash: string | null;
+  afterHash: string | null;
+  sizeBefore: number | null;
+  sizeAfter: number | null;
+  restorable: boolean;
+}
+
+export interface RecoverySummary {
+  created: number;
+  modified: number;
+  deleted: number;
+  total: number;
+}
+
+export interface RunRecovery {
+  runId: string;
+  checkpointId: string;
+  status: RecoveryStatus;
+  capturedAt: string;
+  beforeStateHash: string;
+  afterStateHash: string;
+  currentStateHash: string;
+  restoredAt: string | null;
+  summary: RecoverySummary;
+  files: RecoveryFile[];
+}
+
+export interface RecoverySelection {
+  mode: "all" | "paths";
+  paths?: string[];
+}
+
+export interface RestoreConflict {
+  path: string;
+  code: "changed_since_run" | "path_blocked" | "artifact_missing";
+  expectedHash: string | null;
+  actualHash: string | null;
+  message: string;
+}
+
+export interface RestorePreviewAction {
+  path: string;
+  action: RestoreAction;
+}
+
+export interface RecoveryPreview {
+  id: string;
+  checkpointId: string;
+  expiresAt: string;
+  observedStateHash: string;
+  canApply: boolean;
+  actions: RestorePreviewAction[];
+  conflicts: RestoreConflict[];
+}
+
+export interface RestoreOperation {
+  id: string;
+  status: "completed" | "failed";
+  safetySnapshotId: string;
+  restoredPaths: string[];
+  newStateHash: string;
+  completedAt: string;
 }
 
 export interface SystemInfo {
