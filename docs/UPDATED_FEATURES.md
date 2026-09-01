@@ -82,8 +82,9 @@ flowchart TB
     Service --> Journal
     Service --> RecoveryStore
     Service --> Factory
+    Service --> Attempt
     Factory --> Runner
-    Runner --> Attempt
+    Attempt -. "onTrace wrapper" .-> Runner
     Runner --> Runtime
     Runtime --> Codex
     Codex --> Ark
