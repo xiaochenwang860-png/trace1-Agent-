@@ -56,8 +56,8 @@ codex-home/               Codex configuration and sessions
 one process only.
 
 `RecoveryStore` captures complete workspace manifests and immutable SHA-256
-blobs before and after a Run. In the production path those objects are stored
-in an external bare Git repository per Agent. Restore requires a
+blobs before and after a Run. In the active Git-backed path those objects are
+stored in an external bare Git repository per Agent. Restore requires a
 conflict-checked preview, captures a safety snapshot, and uses a durable
 directory-swap journal that is reconciled on startup. The Agent workspace does
 not contain `.git`; the service invokes only local Git plumbing commands. See
