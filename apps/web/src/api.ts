@@ -46,6 +46,47 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return data;
 }
 
+async function streamDeveloperTrace(
+  id: string,
+  onMessage: (message:
+    | { type: "snapshot"; traces: TraceEvent[] }
+    | { type: "trace"; event: TraceEvent }
+  ) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const response = await fetch("/api/developer/runs/" + id + "/stream", {
+    headers: traceViewerToken
+      ? { "X-Trace-Viewer-Token": traceViewerToken }
+      : {},
+    signal,
+  });
+  if (!response.ok) {
+    const data = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new ApiError(data.error ?? "Trace stream failed", response.status);
+  }
+  if (!response.body) throw new Error("Trace streaming is not supported by this browser");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const consumeLine = (line: string) => {
+    if (!line.trim()) return;
+    onMessage(JSON.parse(line) as
+      | { type: "snapshot"; traces: TraceEvent[] }
+      | { type: "trace"; event: TraceEvent });
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) consumeLine(line);
+    if (done) break;
+  }
+  consumeLine(buffer);
+}
+
 export const api = {
   auth: () =>
     request<{
@@ -146,6 +187,7 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
+  streamDeveloperTrace,
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
   trace: (id: string) =>
     request<{ traces: TraceEvent[] }>("/api/runs/" + id + "/trace", {

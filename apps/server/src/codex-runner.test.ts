@@ -104,6 +104,8 @@ describe("Codex runner protocol", () => {
       status: "success",
       durationMs: expect.any(Number),
     });
+    expect(traces[0]?.operationId).toBeTruthy();
+    expect(traces[1]?.operationId).toBe(traces[0]?.operationId);
   });
 
   it("emits command and file Trace events without storing file contents", () => {
@@ -166,6 +168,8 @@ describe("Codex runner protocol", () => {
     expect(traces[2]?.summary).toContain("/workspace/hello.txt");
     expect(traces[2]?.summary).not.toContain("secret-content");
     expect(traces[0]?.summary).not.toContain("secret-content");
+    expect(traces[0]?.operationId).toBe("command-1");
+    expect(traces[1]?.operationId).toBe("command-1");
   });
 
   it("does not store credentials from command arguments", () => {
@@ -195,5 +199,40 @@ describe("Codex runner protocol", () => {
     expect(traces[0]?.summary).toBe("Command execution: curl");
     expect(traces[0]?.summary).not.toContain("private-token");
     expect(traces[0]?.summary).not.toContain("private-key");
+  });
+
+  it("emits model failures as soon as Codex reports an error", () => {
+    const parsed = {
+      messages: [] as string[],
+      threadId: null as string | null,
+      usage: null,
+      errors: [] as string[],
+      turnStartedAt: null as number | null,
+      itemStartedAt: {} as Record<string, number>,
+    };
+    const traces: RunnerTraceEvent[] = [];
+
+    parseCodexEventLine(
+      JSON.stringify({ type: "turn.started" }),
+      parsed,
+      (event) => traces.push(event),
+    );
+    parseCodexEventLine(
+      JSON.stringify({ type: "error", message: "upstream connection failed" }),
+      parsed,
+      (event) => traces.push(event),
+    );
+
+    expect(traces).toEqual([
+      expect.objectContaining({
+        type: "model.requested",
+      }),
+      expect.objectContaining({
+        type: "model.failed",
+        status: "error",
+        error: "upstream connection failed",
+      }),
+    ]);
+    expect(traces[1]?.operationId).toBe(traces[0]?.operationId);
   });
 });

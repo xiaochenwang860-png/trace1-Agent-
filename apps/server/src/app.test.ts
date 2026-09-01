@@ -12,6 +12,7 @@ const service = {
       traceId: "00000000-0000-4000-8000-000000000001",
       spanId: "trace-1",
       parentSpanId: null,
+      sequence: 1,
       runId: "00000000-0000-4000-8000-000000000001",
       agentId: "agent-1",
       type: "run.completed",
@@ -306,6 +307,87 @@ describe("HTTP boundary", () => {
     expect(response.json()).toMatchObject({
       traces: [{ type: "run.completed", status: "success" }],
     });
+    await app.close();
+  });
+
+  it("streams live Trace events to an authorized Developer Console", async () => {
+    const runId = "00000000-0000-4000-8000-000000000001";
+    const baseEvent = {
+      traceId: runId,
+      runId,
+      agentId: "agent-1",
+      parentSpanId: null,
+      durationMs: null,
+      error: null,
+    };
+    const streamingService = {
+      getRun: () => ({ id: runId, status: "running" }),
+      getTrace: () => [
+        {
+          ...baseEvent,
+          id: "snapshot-event",
+          spanId: "snapshot-event",
+          sequence: 1,
+          type: "run.started",
+          status: "info",
+          timestamp: "2026-08-28T00:00:00.000Z",
+          summary: "Task accepted",
+        },
+      ],
+      subscribeToTrace: (
+        _id: string,
+        subscriber: (event: Record<string, unknown>) => void,
+      ) => {
+        const timer = setTimeout(() => {
+          const toolEvent = {
+            ...baseEvent,
+            id: "tool-event",
+            spanId: "tool-event",
+            sequence: 2,
+            type: "tool.started",
+            status: "info",
+            timestamp: "2026-08-28T00:00:01.000Z",
+            summary: "Command execution: npm",
+          };
+          subscriber(toolEvent);
+          subscriber(toolEvent);
+          subscriber({
+            ...baseEvent,
+            id: "completed-event",
+            spanId: "completed-event",
+            sequence: 3,
+            type: "run.completed",
+            status: "success",
+            timestamp: "2026-08-28T00:00:02.000Z",
+            summary: "Run completed",
+          });
+        }, 0);
+        return () => clearTimeout(timer);
+      },
+    } as unknown as AgentService;
+    const app = await createApp(
+      loadConfig({ NODE_ENV: "test", TRACE_VIEWER_TOKEN: "developer-token" }),
+      streamingService,
+    );
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind");
+
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/developer/runs/${runId}/stream`,
+      { headers: { "X-Trace-Viewer-Token": "developer-token" } },
+    );
+    const messages = (await response.text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line) as { type: string; event?: { type: string } });
+
+    expect(response.status).toBe(200);
+    expect(messages[0]?.type).toBe("snapshot");
+    expect(messages.slice(1).map((message) => message.event?.type)).toEqual([
+      "tool.started",
+      "run.completed",
+    ]);
     await app.close();
   });
 

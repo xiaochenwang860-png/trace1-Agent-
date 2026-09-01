@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
 import { RunCancelledError } from "./errors.js";
@@ -19,6 +20,7 @@ export interface ParsedEvents {
   usage: RunUsage | null;
   errors: string[];
   turnStartedAt: number | null;
+  turnSpanId?: string | null;
   itemStartedAt: Record<string, number>;
 }
 
@@ -111,6 +113,7 @@ export function parseCodexEventLine(
   if (event.type === "turn.started") {
     const timestamp = new Date();
     parsed.turnStartedAt = timestamp.getTime();
+    parsed.turnSpanId = randomUUID();
     onTrace?.({
       type: "model.requested",
       status: "info",
@@ -118,6 +121,7 @@ export function parseCodexEventLine(
       durationMs: null,
       summary: "Codex model turn started",
       error: null,
+      operationId: parsed.turnSpanId,
     });
   }
 
@@ -136,6 +140,8 @@ export function parseCodexEventLine(
         durationMs: null,
         summary: itemSummary(item),
         error: null,
+        ...(typeof item.id === "string" ? { operationId: item.id } : {}),
+        ...(parsed.turnSpanId ? { parentOperationId: parsed.turnSpanId } : {}),
       });
     }
   }
@@ -159,6 +165,8 @@ export function parseCodexEventLine(
             ? "Tool operation failed"
             : "Command exited with code " + exitCode
           : null,
+        ...(typeof item.id === "string" ? { operationId: item.id } : {}),
+        ...(parsed.turnSpanId ? { parentOperationId: parsed.turnSpanId } : {}),
       });
     }
     if (item.type === "file_change") {
@@ -169,6 +177,8 @@ export function parseCodexEventLine(
         durationMs: itemDuration(parsed, item),
         summary: fileChangeSummary(item),
         error: item.status === "failed" ? "File change failed" : null,
+        ...(typeof item.id === "string" ? { operationId: item.id } : {}),
+        ...(parsed.turnSpanId ? { parentOperationId: parsed.turnSpanId } : {}),
       });
     }
   }
@@ -200,7 +210,9 @@ export function parseCodexEventLine(
           : Math.max(0, timestamp.getTime() - parsed.turnStartedAt),
       summary: "Codex model turn completed",
       error: null,
+      ...(parsed.turnSpanId ? { operationId: parsed.turnSpanId } : {}),
     });
+    parsed.turnSpanId = null;
   }
 
   if (event.type === "error") {
@@ -211,6 +223,18 @@ export function parseCodexEventLine(
           ? event.error
           : "Codex reported an unknown error";
     parsed.errors.push(message);
+    onTrace?.({
+      type: "model.failed",
+      status: "error",
+      timestamp: new Date().toISOString(),
+      durationMs:
+        parsed.turnStartedAt === null
+          ? null
+          : Math.max(0, Date.now() - parsed.turnStartedAt),
+      summary: "Codex model turn failed",
+      error: traceText(message, "Codex reported an unknown error"),
+      ...(parsed.turnSpanId ? { operationId: parsed.turnSpanId } : {}),
+    });
   }
 }
 

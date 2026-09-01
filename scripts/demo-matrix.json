@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "defaults": {
+    "copies": 1,
+    "timeoutMs": 180000
+  },
+  "cases": [
+    {
+      "id": "slow-success",
+      "name": "实时慢步骤",
+      "copies": 2,
+      "prompt": "这是一次 Glass Box 实时链路演示。请实际使用工具并严格按顺序执行，不要只描述：\n1. 执行 node -e \"console.log('DEMO_STEP_STARTED'); setTimeout(() => console.log('DEMO_STEP_FINISHED'), 8000)\"。\n2. 创建 observability-demo.txt，内容为 Glass Box realtime trace demo completed.\n3. 使用 Node.js 检查该文件是否存在并输出内容。\n4. 总结每一步结果。\n不要读取 .env、密钥或工作区之外的文件。",
+      "expected": {
+        "statuses": ["completed"],
+        "requiredEvents": [
+          "run.started",
+          "runtime.started",
+          "model.requested",
+          "tool.started",
+          "tool.completed",
+          "file.changed",
+          "model.completed",
+          "run.completed"
+        ],
+        "minimumEventCounts": {
+          "tool.started": 2,
+          "tool.completed": 2
+        },
+        "requiredLiveEvents": ["tool.completed"],
+        "minimumRunDurationMs": 7500,
+        "minimumEventDurationMs": {
+          "tool.completed": 7500
+        },
+        "eventSummaryIncludes": {
+          "file.changed": "observability-demo.txt"
+        }
+      }
+    },
+    {
+      "id": "tool-failure",
+      "name": "确定性工具失败",
+      "copies": 2,
+      "prompt": "这是一次失败链路演示。请实际执行下面的命令一次：node -e \"console.error('DEMO_RECEIVER_TIMEOUT: simulated downstream failure'); process.exit(42)\"。这个失败是预期行为，不要重试、不要修复、不要换成其他命令。命令失败后停止工具操作并总结错误。",
+      "expected": {
+        "statuses": ["completed", "failed"],
+        "requiredEvents": [
+          "run.started",
+          "runtime.started",
+          "tool.started",
+          "tool.failed"
+        ],
+        "requiredLiveEvents": ["tool.failed"],
+        "eventErrorIncludes": {
+          "tool.failed": "42"
+        }
+      }
+    },
+    {
+      "id": "file-lifecycle",
+      "name": "文件审计链路",
+      "prompt": "请实际完成一个文件审计演示：创建 audit-demo.json，内容包含 status=created 和一个当前 ISO 时间；然后使用 Node.js 读取并解析它，确认 status 等于 created；最后总结验证结果。不要访问工作区之外的文件。",
+      "expected": {
+        "statuses": ["completed"],
+        "requiredEvents": [
+          "run.started",
+          "runtime.started",
+          "tool.started",
+          "tool.completed",
+          "file.changed",
+          "run.completed"
+        ],
+        "minimumRunDurationMs": 1500
+      }
+    },
+    {
+      "id": "ordered-tools",
+      "name": "多步骤顺序验证",
+      "prompt": "请实际使用工具依次执行三个步骤，不要并成一个命令：第一步用 Node.js 输出 MATRIX_PHASE_1；第二步用 Node.js 等待 2 秒后输出 MATRIX_PHASE_2；第三步用 Node.js 输出 MATRIX_PHASE_3。完成后按顺序总结三个阶段。",
+      "expected": {
+        "statuses": ["completed"],
+        "requiredEvents": [
+          "run.started",
+          "runtime.started",
+          "model.requested",
+          "tool.started",
+          "tool.completed",
+          "model.completed",
+          "run.completed"
+        ],
+        "minimumEventCounts": {
+          "tool.started": 3,
+          "tool.completed": 3
+        },
+        "minimumRunDurationMs": 1800,
+        "minimumEventDurationMs": {
+          "tool.completed": 1800
+        }
+      }
+    }
+  ]
+}

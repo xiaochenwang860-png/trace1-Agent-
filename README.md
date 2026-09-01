@@ -56,8 +56,13 @@
 | --- | --- |
 | `run.started` | 平台接收任务并创建运行记录 |
 | `runtime.started` | Agent 容器运行环境开始执行 |
+| `attempt.started` | 一次执行尝试开始，并标记尝试序号与目标 |
+| `attempt.completed` | 当前执行尝试成功完成 |
+| `attempt.failed` | 当前执行尝试失败并记录错误分类 |
+| `retry.scheduled` | 调用方已经安排下一次重试及其等待时间 |
 | `model.requested` | Codex 模型回合开始 |
 | `model.completed` | Codex 模型回合完成 |
+| `model.failed` | Codex 模型回合失败 |
 | `tool.started` | Agent 开始调用工具或命令 |
 | `tool.completed` | 工具或命令执行成功 |
 | `tool.failed` | 工具或命令执行失败 |
@@ -306,10 +311,12 @@ Users can only access their own Agents. Authorized developers can drill down fro
 A run records the following event types:
 
 ```text
-run.started       runtime.started     model.requested
-model.completed   tool.started        tool.completed
-tool.failed       file.changed        run.completed
-run.failed        run.cancelled
+run.started       runtime.started     attempt.started
+attempt.completed attempt.failed      retry.scheduled
+model.requested   model.completed     model.failed
+tool.started      tool.completed      tool.failed
+file.changed      run.completed       run.failed
+run.cancelled
 ```
 
 Every event is correlated through stable **Trace ID**, **Span ID**, and **Parent Span ID** values. In this POC, the Trace ID normally maps to the run.
@@ -433,5 +440,8 @@ Further references:
 - [Local POC guide](docs/LOCAL_POC.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
 - [Hackathon extension guide](docs/HACKATHON_EXTENSION_GUIDE.md)
+- [Glass Box work summary](docs/GLASS_BOX_WORK_SUMMARY.md)
+- [Behavior matrix demo guide](docs/DEMO_MATRIX.md)
+- [Retry / fallback Trace contract](docs/RETRY_TRACE_CONTRACT.md)
 
 Licensed under the [MIT License](LICENSE).

@@ -16,7 +16,7 @@ const fallbackUser = (): User => ({
 });
 
 const emptyDatabase = (user?: User): Database => ({
-  version: 3,
+  version: 4,
   users: user ? [user] : [],
   credentials: [],
   authSessions: [],
@@ -30,19 +30,27 @@ type StoredDatabase = Omit<
   Database,
   "version" | "users" | "credentials" | "authSessions" | "agents" | "traces"
 > & {
-  version: 1 | 2 | 3;
+  version: 1 | 2 | 3 | 4;
   users?: unknown;
   credentials?: unknown;
   authSessions?: unknown;
   agents: StoredAgent[];
   traces?: unknown;
 };
-type StoredTraceEvent = Omit<TraceEvent, "traceId" | "spanId" | "parentSpanId"> &
-  Partial<Pick<TraceEvent, "traceId" | "spanId" | "parentSpanId">>;
+type StoredTraceEvent = Omit<
+  TraceEvent,
+  "traceId" | "spanId" | "parentSpanId" | "sequence"
+> &
+  Partial<Pick<TraceEvent, "traceId" | "spanId" | "parentSpanId" | "sequence">>;
 
 const runtimeChildEventTypes = new Set<TraceEvent["type"]>([
+  "attempt.started",
+  "attempt.completed",
+  "attempt.failed",
+  "retry.scheduled",
   "model.requested",
   "model.completed",
+  "model.failed",
   "tool.started",
   "tool.completed",
   "tool.failed",
@@ -50,11 +58,18 @@ const runtimeChildEventTypes = new Set<TraceEvent["type"]>([
 ]);
 
 function migrateTraces(events: StoredTraceEvent[]): TraceEvent[] {
-  const withIds = events.map((event) => ({
-    ...event,
-    traceId: event.traceId ?? event.runId,
-    spanId: event.spanId ?? event.id,
-  }));
+  const sequences = new Map<string, number>();
+  const withIds = events.map((event) => {
+    const nextSequence = (sequences.get(event.runId) ?? 0) + 1;
+    const sequence = event.sequence ?? nextSequence;
+    sequences.set(event.runId, Math.max(nextSequence, sequence));
+    return {
+      ...event,
+      traceId: event.traceId ?? event.runId,
+      spanId: event.spanId ?? event.id,
+      sequence,
+    };
+  });
 
   return withIds.map((event) => {
     if (event.parentSpanId !== undefined) {
@@ -89,7 +104,7 @@ export class JsonStore {
     try {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = JSON.parse(raw) as StoredDatabase;
-      if (![1, 2, 3].includes(parsed.version) || !Array.isArray(parsed.agents)) {
+      if (![1, 2, 3, 4].includes(parsed.version) || !Array.isArray(parsed.agents)) {
         throw new Error("Unsupported database format");
       }
 
@@ -111,14 +126,14 @@ export class JsonStore {
         ownerUserId: agent.ownerUserId ?? migrationUser.id,
       })) as Agent[];
       const needsUserMigration =
-        parsed.version !== 3 ||
+        parsed.version !== 4 ||
         storedUsers.length === 0 ||
         parsed.agents.some((agent) => !agent.ownerUserId);
 
       if (parsed.traces === undefined) {
         this.data = {
           ...parsed,
-          version: 3,
+          version: 4,
           users,
           credentials,
           authSessions,
@@ -136,11 +151,12 @@ export class JsonStore {
             event === null ||
             !("traceId" in event) ||
             !("spanId" in event) ||
-            !("parentSpanId" in event),
+            !("parentSpanId" in event) ||
+            !("sequence" in event),
         );
         this.data = {
           ...parsed,
-          version: 3,
+          version: 4,
           users,
           credentials,
           authSessions,

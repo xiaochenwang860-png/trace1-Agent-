@@ -102,8 +102,13 @@ export interface AgentRun {
 export type TraceEventType =
   | "run.started"
   | "runtime.started"
+  | "attempt.started"
+  | "attempt.completed"
+  | "attempt.failed"
+  | "retry.scheduled"
   | "model.requested"
   | "model.completed"
+  | "model.failed"
   | "tool.started"
   | "tool.completed"
   | "tool.failed"
@@ -117,6 +122,7 @@ export interface TraceEvent {
   traceId: string;
   spanId: string;
   parentSpanId: string | null;
+  sequence: number;
   runId: string;
   agentId: string;
   type: TraceEventType;
@@ -125,12 +131,24 @@ export interface TraceEvent {
   durationMs: number | null;
   summary: string;
   error: string | null;
+  attemptId?: string | undefined;
+  attemptNumber?: number | undefined;
+  retryOfAttemptId?: string | null | undefined;
+  nextAttemptId?: string | undefined;
+  retryDelayMs?: number | undefined;
+  errorCode?: string | undefined;
+  retryable?: boolean | undefined;
 }
 
 export interface RunnerTraceEvent {
   type:
+    | "attempt.started"
+    | "attempt.completed"
+    | "attempt.failed"
+    | "retry.scheduled"
     | "model.requested"
     | "model.completed"
+    | "model.failed"
     | "tool.started"
     | "tool.completed"
     | "tool.failed"
@@ -140,10 +158,19 @@ export interface RunnerTraceEvent {
   durationMs: number | null;
   summary: string;
   error: string | null;
+  operationId?: string | undefined;
+  parentOperationId?: string | undefined;
+  attemptId?: string | undefined;
+  attemptNumber?: number | undefined;
+  retryOfAttemptId?: string | null | undefined;
+  nextAttemptId?: string | undefined;
+  retryDelayMs?: number | undefined;
+  errorCode?: string | undefined;
+  retryable?: boolean | undefined;
 }
 
 export interface Database {
-  version: 3;
+  version: 4;
   users: User[];
   credentials: UserCredential[];
   authSessions: AuthSession[];
