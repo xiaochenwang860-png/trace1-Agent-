@@ -9,6 +9,7 @@ describe("createTextRedactor", () => {
       ARK_API_KEY: "ark-private-value-123456",
       ARK_MODEL: "ep-test",
       TRACE_VIEWER_TOKEN: "developer-secret-token",
+      RECOVERY_OPERATOR_TOKEN: "recovery-secret-token",
       APP_AUTH_TOKEN: "legacy-secret-token",
       APP_USERS_JSON: JSON.stringify([
         { id: "alice", name: "Alice", token: "alice-session-token" },
@@ -18,6 +19,7 @@ describe("createTextRedactor", () => {
     const source = [
       "ARK_API_KEY=ark-private-value-123456",
       "Bearer developer-secret-token",
+      "RECOVERY_OPERATOR_TOKEN=recovery-secret-token",
       "token=alice-session-token",
       "https://example.test/?access_token=legacy-secret-token",
     ].join("; ");
@@ -28,6 +30,7 @@ describe("createTextRedactor", () => {
     expect(result).toContain("Bearer [REDACTED_TOKEN]");
     expect(result).not.toContain("ark-private-value-123456");
     expect(result).not.toContain("developer-secret-token");
+    expect(result).not.toContain("recovery-secret-token");
     expect(result).not.toContain("legacy-secret-token");
     expect(result).not.toContain("alice-session-token");
   });

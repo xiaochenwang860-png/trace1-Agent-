@@ -15,6 +15,13 @@ const envSchema = z.object({
     .default("workspace-write"),
   CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(600_000),
   CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
+  GIT_BIN: z.string().trim().min(1).default("git"),
+  GIT_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(30_000),
+  GIT_MAX_OUTPUT_BYTES: z.coerce
+    .number()
+    .int()
+    .min(65_536)
+    .default(33_554_432),
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),
   CONTAINER_RUNTIME_IMAGE: z.string().min(1).default("volc-agent-runtime:local"),
@@ -47,6 +54,22 @@ const envSchema = z.object({
       "TRACE_VIEWER_TOKEN must use URL-safe characters",
     )
     .optional(),
+  RECOVERY_OPERATOR_TOKEN: z
+    .string()
+    .trim()
+    .max(128)
+    .regex(
+      /^[A-Za-z0-9._~-]*$/,
+      "RECOVERY_OPERATOR_TOKEN must use URL-safe characters",
+    )
+    .optional(),
+  RECOVERY_OPERATOR_ID: z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .regex(/^[A-Za-z0-9_.-]+$/, "RECOVERY_OPERATOR_ID must use URL-safe characters")
+    .default("local-recovery-operator"),
   APP_USERS_JSON: z.string().optional(),
   ARK_API_KEY: z.string().optional(),
   ARK_MODEL: z.string().optional(),
@@ -127,7 +150,23 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const env = envSchema.parse(environment);
   const authToken = env.APP_AUTH_TOKEN?.trim() ?? "";
   const traceViewerToken = env.TRACE_VIEWER_TOKEN?.trim() ?? "";
+  const recoveryOperatorToken = env.RECOVERY_OPERATOR_TOKEN?.trim() ?? "";
+  const arkModel = env.ARK_MODEL?.trim() ?? "";
+  if (/^(?:ark|apikey)-/i.test(arkModel)) {
+    throw new Error(
+      "ARK_MODEL looks like an API key; use an Ark endpoint/model ID such as ep-xxxxxxxx",
+    );
+  }
   const userAccounts = parseUserAccounts(env.APP_USERS_JSON, authToken);
+  if (
+    recoveryOperatorToken.length > 0 &&
+    (recoveryOperatorToken === traceViewerToken ||
+      userAccounts.some((account) => account.token === recoveryOperatorToken))
+  ) {
+    throw new Error(
+      "RECOVERY_OPERATOR_TOKEN must not reuse a Trace viewer or user access token",
+    );
+  }
   const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
   if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
     if (
@@ -139,6 +178,15 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     ) {
       throw new Error(
         "Every user access token must contain at least 24 characters for a non-loopback production server",
+      );
+    }
+    if (
+      recoveryOperatorToken.length > 0 &&
+      (recoveryOperatorToken.length < 24 ||
+        recoveryOperatorToken.startsWith("replace-"))
+    ) {
+      throw new Error(
+        "RECOVERY_OPERATOR_TOKEN must contain at least 24 characters for a non-loopback production server",
       );
     }
   }
@@ -157,6 +205,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     codexSandboxMode: env.CODEX_SANDBOX_MODE,
     codexTimeoutMs: env.CODEX_TIMEOUT_MS,
     codexMaxOutputBytes: env.CODEX_MAX_OUTPUT_BYTES,
+    gitBin: env.GIT_BIN,
+    gitTimeoutMs: env.GIT_TIMEOUT_MS,
+    gitMaxOutputBytes: env.GIT_MAX_OUTPUT_BYTES,
     runtimeProvider: env.RUNTIME_PROVIDER,
     containerEngine: env.CONTAINER_ENGINE,
     containerRuntimeImage: env.CONTAINER_RUNTIME_IMAGE,
@@ -169,8 +220,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     userAccounts,
     userAuthRequired: userAccounts.some((account) => account.token.length > 0),
     traceViewerToken,
+    recoveryOperatorToken,
+    recoveryOperatorId: env.RECOVERY_OPERATOR_ID,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
-    arkModel: env.ARK_MODEL?.trim() ?? "",
+    arkModel,
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
     nodeEnv: env.NODE_ENV,
   };

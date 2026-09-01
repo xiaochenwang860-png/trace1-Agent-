@@ -87,6 +87,141 @@ export interface RunUsage {
   outputTokens?: number;
 }
 
+export interface WorkspaceRecoveryCheckpointMetadata {
+  rootHash: string;
+  policyId: string;
+  fileCount: number;
+  totalBytes: number;
+  capturedAt: string;
+}
+
+export interface GitWorkspaceRecoveryCheckpoint
+  extends WorkspaceRecoveryCheckpointMetadata {
+  storage: "git-sha256-v1";
+  repositoryId: string;
+  commitOid: string;
+  workspaceTreeOid: string;
+  manifestBlobOid: string;
+}
+
+export interface LegacyUnavailableWorkspaceRecoveryCheckpoint
+  extends WorkspaceRecoveryCheckpointMetadata {
+  storage: "legacy-unavailable-v1";
+  unavailableReason: string;
+}
+
+export type WorkspaceRecoveryCheckpoint =
+  | GitWorkspaceRecoveryCheckpoint
+  | LegacyUnavailableWorkspaceRecoveryCheckpoint;
+
+export function isGitWorkspaceRecoveryCheckpoint(
+  checkpoint: WorkspaceRecoveryCheckpoint | null | undefined,
+): checkpoint is GitWorkspaceRecoveryCheckpoint {
+  return checkpoint?.storage === "git-sha256-v1";
+}
+
+export interface WorkspaceRestoreAudit {
+  id: string;
+  idempotencyKeyHash: string;
+  checkpointId: string;
+  actorType: "owner" | "developer";
+  actorId: string | null;
+  mode: "all" | "paths";
+  selectedPaths: string[];
+  restoredPaths: string[];
+  previousRootHash: string;
+  restoredRootHash: string;
+  safetySnapshotId: string;
+  quarantinePath: string;
+  completedAt: string;
+}
+
+export interface WorkspaceRestoreIntent {
+  id: string;
+  idempotencyKeyHash: string;
+  checkpointId: string;
+  actorType: "owner" | "developer";
+  actorId: string | null;
+  mode: "all" | "paths";
+  selectedPaths: string[];
+  restoredPaths: string[];
+  expectedRootHash: string;
+  resultingRootHash: string;
+  startedAt: string;
+}
+
+export interface RunRecoveryState {
+  before: WorkspaceRecoveryCheckpoint | null;
+  after: WorkspaceRecoveryCheckpoint | null;
+  captureError: string | null;
+  pendingRestores: WorkspaceRestoreIntent[];
+  restores: WorkspaceRestoreAudit[];
+}
+
+export type RecoveryStatus = "available" | "restored" | "blocked" | "unavailable";
+
+export interface RecoveryFile {
+  path: string;
+  kind: "created" | "modified" | "deleted";
+  beforeHash: string | null;
+  afterHash: string | null;
+  sizeBefore: number | null;
+  sizeAfter: number | null;
+  restorable: boolean;
+}
+
+export interface RecoverySummary {
+  created: number;
+  modified: number;
+  deleted: number;
+  total: number;
+}
+
+export interface RunRecovery {
+  runId: string;
+  checkpointId: string;
+  status: RecoveryStatus;
+  capturedAt: string;
+  beforeStateHash: string;
+  afterStateHash: string;
+  currentStateHash: string;
+  restoredAt: string | null;
+  summary: RecoverySummary;
+  files: RecoveryFile[];
+}
+
+export interface RecoverySelection {
+  mode: "all" | "paths";
+  paths?: string[] | undefined;
+}
+
+export interface RestoreConflict {
+  path: string;
+  code: "changed_since_run" | "path_blocked" | "artifact_missing";
+  expectedHash: string | null;
+  actualHash: string | null;
+  message: string;
+}
+
+export interface RecoveryPreview {
+  id: string;
+  checkpointId: string;
+  expiresAt: string;
+  observedStateHash: string;
+  canApply: boolean;
+  actions: Array<{ path: string; action: "create" | "replace" | "delete" }>;
+  conflicts: RestoreConflict[];
+}
+
+export interface RestoreOperation {
+  id: string;
+  status: "completed" | "failed";
+  safetySnapshotId: string;
+  restoredPaths: string[];
+  newStateHash: string;
+  completedAt: string;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;
@@ -95,6 +230,7 @@ export interface AgentRun {
   output: string | null;
   error: string | null;
   usage: RunUsage | null;
+  recovery: RunRecoveryState;
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
@@ -113,6 +249,12 @@ export type TraceEventType =
   | "tool.completed"
   | "tool.failed"
   | "file.changed"
+  | "workspace.checkpoint.created"
+  | "workspace.diff.generated"
+  | "workspace.restore.started"
+  | "workspace.restore.completed"
+  | "workspace.restore.blocked"
+  | "workspace.restore.failed"
   | "run.completed"
   | "run.failed"
   | "run.cancelled";
@@ -122,7 +264,6 @@ export interface TraceEvent {
   traceId: string;
   spanId: string;
   parentSpanId: string | null;
-  sequence: number;
   runId: string;
   agentId: string;
   type: TraceEventType;
@@ -131,6 +272,7 @@ export interface TraceEvent {
   durationMs: number | null;
   summary: string;
   error: string | null;
+  sequence: number;
   attemptId?: string | undefined;
   attemptNumber?: number | undefined;
   retryOfAttemptId?: string | null | undefined;
@@ -170,7 +312,7 @@ export interface RunnerTraceEvent {
 }
 
 export interface Database {
-  version: 4;
+  version: 6;
   users: User[];
   credentials: UserCredential[];
   authSessions: AuthSession[];

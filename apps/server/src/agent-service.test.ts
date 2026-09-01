@@ -1,13 +1,12 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
-import { AttemptTrace } from "./attempt-trace.js";
 import { loadConfig } from "./config.js";
+import { RecoveryStore } from "./recovery-store.js";
 import { JsonStore } from "./store.js";
-import { TraceJournal } from "./trace-journal.js";
-import type { AgentRunner, RunnerRequest, RunnerResult, TraceEvent } from "./types.js";
+import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -20,7 +19,6 @@ class FakeRunner implements AgentRunner {
       durationMs: null,
       summary: "Codex model turn started",
       error: null,
-      operationId: "model-turn-1",
     });
     request.onTrace?.({
       type: "model.completed",
@@ -29,7 +27,6 @@ class FakeRunner implements AgentRunner {
       durationMs: 1,
       summary: "Codex model turn completed",
       error: null,
-      operationId: "model-turn-1",
     });
     return {
       output: "Completed: " + request.prompt,
@@ -62,6 +59,18 @@ async function makeService(
 ): Promise<AgentService> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
+  return (await openService(root, runner, environment)).service;
+}
+
+async function openService(
+  root: string,
+  runner: AgentRunner = new FakeRunner(),
+  environment: NodeJS.ProcessEnv = {},
+): Promise<{
+  service: AgentService;
+  store: JsonStore;
+  recoveryStore: RecoveryStore;
+}> {
   const config = loadConfig({
     NODE_ENV: "test",
     APP_DATA_DIR: path.join(root, "data"),
@@ -71,14 +80,19 @@ async function makeService(
     ARK_MODEL: "ep-test",
     ...environment,
   });
+  const store = new JsonStore(path.join(root, "data", "db.json"));
+  const recoveryStore = new RecoveryStore(path.join(root, "data", "recovery"), {
+    allowTestFileBackend: true,
+  });
   const service = new AgentService(
     config,
-    new JsonStore(path.join(root, "data", "db.json")),
+    store,
     new WorkspaceManager(path.join(root, "workspaces")),
     runner,
+    recoveryStore,
   );
   await service.initialize();
-  return service;
+  return { service, store, recoveryStore };
 }
 
 describe("Agent lifecycle", () => {
@@ -164,19 +178,26 @@ describe("Agent lifecycle", () => {
     const trace = service.getTrace(run.id);
     expect(trace.map((event) => event.type)).toEqual([
       "run.started",
+      "workspace.checkpoint.created",
       "runtime.started",
+      "attempt.started",
       "model.requested",
       "model.completed",
+      "attempt.completed",
+      "workspace.diff.generated",
       "run.completed",
     ]);
     expect(new Set(trace.map((event) => event.traceId))).toEqual(new Set([run.id]));
-    expect(trace.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5]);
-    expect(trace[2]?.spanId).toBe(trace[3]?.spanId);
+    expect(new Set(trace.map((event) => event.spanId)).size).toBe(trace.length - 1);
     expect(trace[0]?.parentSpanId).toBeNull();
     expect(trace[1]?.parentSpanId).toBe(trace[0]?.spanId);
-    expect(trace[2]?.parentSpanId).toBe(trace[1]?.spanId);
-    expect(trace[3]?.parentSpanId).toBe(trace[1]?.spanId);
-    expect(trace[4]?.parentSpanId).toBe(trace[0]?.spanId);
+    expect(trace[2]?.parentSpanId).toBe(trace[0]?.spanId);
+    expect(trace[3]?.parentSpanId).toBe(trace[2]?.spanId);
+    expect(trace[4]?.parentSpanId).toBe(trace[3]?.spanId);
+    expect(trace[5]?.parentSpanId).toBe(trace[3]?.spanId);
+    expect(trace[6]?.parentSpanId).toBe(trace[2]?.spanId);
+    expect(trace[7]?.parentSpanId).toBe(trace[2]?.spanId);
+    expect(trace[8]?.parentSpanId).toBe(trace[0]?.spanId);
     expect(trace.at(-1)).toMatchObject({
       status: "success",
       durationMs: expect.any(Number),
@@ -201,240 +222,285 @@ describe("Agent lifecycle", () => {
 
     await expect.poll(() => service.getRun(run.id).status).toBe("failed");
 
-    expect(service.getTrace(run.id).map((event) => event.type)).toEqual([
-      "run.started",
-      "runtime.started",
-      "file.changed",
-      "run.failed",
-    ]);
-    expect(service.getTrace(run.id).at(-1)).toMatchObject({
+    const trace = service.getTrace(run.id);
+    const eventTypes = trace.map((event) => event.type);
+    expect(eventTypes).toEqual(
+      expect.arrayContaining([
+        "run.started",
+        "workspace.checkpoint.created",
+        "runtime.started",
+        "file.changed",
+        "workspace.diff.generated",
+        "run.failed",
+      ]),
+    );
+    expect(eventTypes.indexOf("workspace.checkpoint.created")).toBeLessThan(
+      eventTypes.indexOf("runtime.started"),
+    );
+    expect(trace.at(-1)).toMatchObject({
       status: "error",
       error: "Runtime unavailable",
     });
-    expect(service.getTrace(run.id)[2]?.summary).toContain("partial-result.txt");
+    expect(trace.find((event) => event.type === "file.changed")?.summary).toContain(
+      "partial-result.txt",
+    );
   });
 
-  it("keeps the Run successful when a failed attempt is recovered by retry", async () => {
+  it("restores exact bytes deleted by a failed run and resets stale model context", async () => {
+    let invocation = 0;
     const service = await makeService({
       run: async (request) => {
-        const first = new AttemptTrace(request.onTrace, {
-          attemptId: "attempt-1",
-          attemptNumber: 1,
-        });
-        first.fail({
-          error: new Error("temporary upstream timeout"),
-          errorCode: "TIMEOUT",
-          retryable: true,
-        });
-        const nextAttemptId = first.scheduleRetry({
-          nextAttemptId: "attempt-2",
-          delayMs: 0,
-        });
-        const second = new AttemptTrace(request.onTrace, {
-          attemptId: nextAttemptId,
-          attemptNumber: 2,
-          retryOfAttemptId: first.attemptId,
-        });
-        second.complete();
-        return { output: "recovered", threadId: "thread", usage: null };
+        invocation += 1;
+        if (invocation === 1) {
+          return { output: "thread established", threadId: "stale-thread", usage: null };
+        }
+        await rm(path.join(request.workspacePath, "src", "nested", "payload.bin"));
+        throw new Error("failed after deleting payload");
       },
       cancel: async () => false,
       isAvailable: async () => true,
     });
-    const agent = await service.createAgent({ name: "Retry Agent" });
-    const { run } = await service.sendMessage(agent.id, "retry a transient failure");
+    const agent = await service.createAgent({ name: "Recovery Agent" });
+    const first = await service.sendMessage(agent.id, "establish context");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+    expect(service.getAgent(agent.id).codexThreadId).toBe("stale-thread");
 
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-    const trace = service.getTrace(run.id);
-    expect(trace.map((event) => event.type)).toEqual([
-      "run.started",
-      "runtime.started",
-      "attempt.started",
-      "attempt.failed",
-      "retry.scheduled",
-      "attempt.started",
-      "attempt.completed",
-      "run.completed",
-    ]);
-    expect(trace[2]).toMatchObject({
-      spanId: "attempt-1",
-      attemptId: "attempt-1",
-      attemptNumber: 1,
-      parentSpanId: trace[1]?.spanId,
+    const deletedPath = path.join(agent.workspacePath, "src", "nested", "payload.bin");
+    const originalBytes = Buffer.from([0, 255, 13, 10, 42, 128, 7]);
+    await mkdir(path.dirname(deletedPath), { recursive: true });
+    await writeFile(deletedPath, originalBytes);
+    const failed = await service.sendMessage(agent.id, "delete then fail");
+    await expect.poll(() => service.getRun(failed.run.id).status).toBe("failed");
+    await expect(readFile(deletedPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+    const recovery = await service.getRunRecovery(failed.run.id, agent.ownerUserId);
+    expect(recovery.summary).toMatchObject({ deleted: 1, total: 1 });
+    expect(recovery.files).toContainEqual(
+      expect.objectContaining({ path: "src/nested/payload.bin", kind: "deleted" }),
+    );
+    await expect(
+      service.getRunRecovery(failed.run.id, "another-owner"),
+    ).rejects.toMatchObject({ statusCode: 404 });
+
+    const selection = { mode: "paths" as const, paths: ["src/nested/payload.bin"] };
+    const actor = { type: "owner" as const, id: agent.ownerUserId };
+    const preview = await service.previewRunRecovery(
+      failed.run.id,
+      recovery.checkpointId,
+      selection,
+      actor,
+      agent.ownerUserId,
+    );
+    expect(preview).toMatchObject({
+      canApply: true,
+      actions: [{ path: "src/nested/payload.bin", action: "create" }],
+      conflicts: [],
     });
-    expect(trace[3]).toMatchObject({
-      spanId: "attempt-1",
-      errorCode: "TIMEOUT",
-      retryable: true,
+    const operation = await service.restoreRunRecovery(
+      failed.run.id,
+      recovery.checkpointId,
+      preview.id,
+      selection,
+      "restore-deleted-payload",
+      actor,
+      agent.ownerUserId,
+    );
+
+    expect(operation.status).toBe("completed");
+    expect(operation.restoredPaths).toContain("src/nested/payload.bin");
+    expect(service.getRun(failed.run.id).recovery).toMatchObject({
+      pendingRestores: [],
+      restores: [expect.objectContaining({ id: operation.id })],
     });
-    expect(trace[4]).toMatchObject({
-      parentSpanId: "attempt-1",
-      nextAttemptId: "attempt-2",
-      retryDelayMs: 0,
+    expect(await readFile(deletedPath)).toEqual(originalBytes);
+    expect(service.getAgent(agent.id)).toMatchObject({
+      status: "ready",
+      codexThreadId: null,
     });
-    expect(trace[5]).toMatchObject({
-      spanId: "attempt-2",
-      retryOfAttemptId: "attempt-1",
-    });
-    expect(trace.at(-1)?.type).toBe("run.completed");
+    expect(service.getTrace(failed.run.id).map((event) => event.type)).toEqual(
+      expect.arrayContaining([
+        "workspace.restore.started",
+        "workspace.restore.completed",
+      ]),
+    );
   });
 
-  it("publishes Runner Trace events before the Run completes", async () => {
-    let emitTrace: RunnerRequest["onTrace"];
-    let finish!: (result: RunnerResult) => void;
-    let announceRunner!: () => void;
-    const runnerStarted = new Promise<void>((resolve) => {
-      announceRunner = resolve;
-    });
-    const pending = new Promise<RunnerResult>((resolve) => {
-      finish = resolve;
-    });
+  it("blocks a stale restore preview without overwriting newer user content", async () => {
     const service = await makeService({
-      run: (request) => {
-        emitTrace = request.onTrace;
-        announceRunner();
-        return pending;
+      run: async (request) => {
+        await rm(path.join(request.workspacePath, "important.txt"));
+        throw new Error("failed after delete");
       },
       cancel: async () => false,
       isAvailable: async () => true,
     });
-    const agent = await service.createAgent({ name: "Live Trace" });
-    const { run } = await service.sendMessage(agent.id, "observe this run");
-    const received: string[] = [];
-    const unsubscribe = service.subscribeToTrace(run.id, (event) => {
-      received.push(event.type);
-    });
+    const agent = await service.createAgent({ name: "Conflict Agent" });
+    const importantPath = path.join(agent.workspacePath, "important.txt");
+    await writeFile(importantPath, "checkpoint content", "utf8");
+    const failed = await service.sendMessage(agent.id, "delete important file");
+    await expect.poll(() => service.getRun(failed.run.id).status).toBe("failed");
 
-    await runnerStarted;
-    emitTrace?.({
-      type: "model.requested",
-      status: "info",
-      timestamp: new Date().toISOString(),
-      durationMs: null,
-      summary: "Codex model turn started",
-      error: null,
-    });
-
-    expect(received).toEqual(["runtime.started", "model.requested"]);
-    expect(service.getRun(run.id).status).toBe("running");
-    expect(service.getTrace(run.id).map((event) => event.type)).toContain(
-      "model.requested",
+    const recovery = await service.getRunRecovery(failed.run.id, agent.ownerUserId);
+    const selection = { mode: "paths" as const, paths: ["important.txt"] };
+    const actor = { type: "owner" as const, id: agent.ownerUserId };
+    const preview = await service.previewRunRecovery(
+      failed.run.id,
+      recovery.checkpointId,
+      selection,
+      actor,
+      agent.ownerUserId,
     );
+    expect(preview.canApply).toBe(true);
 
-    finish({ output: "done", threadId: "thread", usage: null });
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-    unsubscribe();
+    await writeFile(importantPath, "newer user content", "utf8");
+    await expect(
+      service.restoreRunRecovery(
+        failed.run.id,
+        recovery.checkpointId,
+        preview.id,
+        selection,
+        "stale-preview-restore",
+        actor,
+        agent.ownerUserId,
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      payload: { preview: { canApply: false } },
+    });
+    expect(await readFile(importantPath, "utf8")).toBe("newer user content");
+    expect(service.getRun(failed.run.id).recovery.pendingRestores).toEqual([]);
+    expect(service.getAgent(agent.id)).toMatchObject({
+      status: "error",
+      lastError: "failed after delete",
+    });
+    expect(service.getTrace(failed.run.id).map((event) => event.type)).toContain(
+      "workspace.restore.blocked",
+    );
   });
 
-  it("recovers live Trace journal records after a server restart", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "launchpad-recovery-test-"));
+  it("reconciles a committed filesystem restore whose audit was interrupted", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
     temporaryDirectories.push(root);
-    const dataDirectory = path.join(root, "data");
-    const workspaceRoot = path.join(root, "workspaces");
-    const config = loadConfig({
-      NODE_ENV: "test",
-      APP_DATA_DIR: dataDirectory,
-      AGENT_WORKSPACE_ROOT: workspaceRoot,
-      CODEX_HOME: path.join(root, "codex"),
-      ARK_API_KEY: "test-key",
-      ARK_MODEL: "ep-test",
-    });
-    const seedStore = new JsonStore(path.join(dataDirectory, "db.json"));
-    await seedStore.initialize();
-    const createdAt = "2026-08-28T00:00:00.000Z";
-    await seedStore.mutate((database) => {
-      database.agents.push({
-        id: "agent-1",
-        ownerUserId: "local-user",
-        name: "Recovery Agent",
-        description: "",
-        instructions: "",
-        status: "busy",
-        workspacePath: path.join(workspaceRoot, "agent-1"),
-        codexThreadId: null,
-        lastError: null,
-        createdAt,
-        updatedAt: createdAt,
-      });
-      database.runs.push({
-        id: "run-1",
-        agentId: "agent-1",
-        status: "running",
-        prompt: "recover me",
-        output: null,
-        error: null,
-        usage: null,
-        startedAt: createdAt,
-        completedAt: null,
-        createdAt,
-      });
-      database.traces.push(
-        {
-          id: "event-1",
-          traceId: "run-1",
-          spanId: "run-span",
-          parentSpanId: null,
-          sequence: 1,
-          runId: "run-1",
-          agentId: "agent-1",
-          type: "run.started",
-          status: "info",
-          timestamp: createdAt,
-          durationMs: null,
-          summary: "Task accepted",
-          error: null,
-        },
-        {
-          id: "event-2",
-          traceId: "run-1",
-          spanId: "runtime-span",
-          parentSpanId: "run-span",
-          sequence: 2,
-          runId: "run-1",
-          agentId: "agent-1",
-          type: "runtime.started",
-          status: "info",
-          timestamp: createdAt,
-          durationMs: null,
-          summary: "Runtime started",
-          error: null,
-        },
-      );
-    });
-    const journal = new TraceJournal(path.join(dataDirectory, "trace-journal"));
-    await journal.initialize();
-    const liveEvent: TraceEvent = {
-      id: "event-3",
-      traceId: "run-1",
-      spanId: "tool-span",
-      parentSpanId: "runtime-span",
-      sequence: 3,
-      runId: "run-1",
-      agentId: "agent-1",
-      type: "tool.started",
-      status: "info",
-      timestamp: "2026-08-28T00:00:01.000Z",
-      durationMs: null,
-      summary: "Command execution: npm",
-      error: null,
-    };
-    await journal.append(liveEvent);
+    const initial = await openService(root);
+    const agent = await initial.service.createAgent({ name: "Restart Recovery" });
+    const { run } = await initial.service.sendMessage(agent.id, "establish model context");
+    await expect.poll(() => initial.service.getRun(run.id).status).toBe("completed");
 
-    const service = new AgentService(
-      config,
-      new JsonStore(path.join(dataDirectory, "db.json")),
-      new WorkspaceManager(workspaceRoot),
-      new FakeRunner(),
+    const statePath = path.join(agent.workspacePath, "state.txt");
+    await writeFile(statePath, "broken state", "utf8");
+    const expected = await initial.recoveryStore.capture(agent.workspacePath);
+    await writeFile(statePath, "recovered state", "utf8");
+    const resulting = await initial.recoveryStore.capture(agent.workspacePath);
+    const operationId = "00000000-0000-4000-8000-000000000101";
+    const startedAt = new Date(Date.now() - 1_000).toISOString();
+
+    await initial.store.mutate((database) => {
+      const storedRun = database.runs.find((candidate) => candidate.id === run.id);
+      const storedAgent = database.agents.find((candidate) => candidate.id === agent.id);
+      if (!storedRun || !storedAgent || !storedRun.recovery.before) {
+        throw new Error("Recovery fixture was not persisted");
+      }
+      storedRun.recovery.pendingRestores.push({
+        id: operationId,
+        idempotencyKeyHash: "1".repeat(64),
+        checkpointId: storedRun.recovery.before.rootHash,
+        actorType: "owner",
+        actorId: agent.ownerUserId,
+        mode: "paths",
+        selectedPaths: ["state.txt"],
+        restoredPaths: ["state.txt"],
+        expectedRootHash: expected.rootHash,
+        resultingRootHash: resulting.rootHash,
+        startedAt,
+      });
+      storedAgent.status = "busy";
+      storedAgent.codexThreadId = "stale-thread-after-restore";
+    });
+
+    const restarted = await openService(root);
+    const recoveredRun = restarted.service.getRun(run.id);
+    expect(recoveredRun.recovery.pendingRestores).toEqual([]);
+    expect(recoveredRun.recovery.restores).toContainEqual(
+      expect.objectContaining({
+        id: operationId,
+        previousRootHash: expected.rootHash,
+        restoredRootHash: resulting.rootHash,
+        safetySnapshotId: expected.rootHash,
+        restoredPaths: ["state.txt"],
+      }),
     );
-    await service.initialize();
+    expect(restarted.service.getAgent(agent.id)).toMatchObject({
+      status: "ready",
+      codexThreadId: null,
+      lastError: null,
+    });
+    expect(await readFile(statePath, "utf8")).toBe("recovered state");
+    expect(restarted.service.getTrace(run.id)).toContainEqual(
+      expect.objectContaining({
+        type: "workspace.restore.completed",
+        status: "success",
+        summary: expect.stringContaining("reconciled after restart"),
+      }),
+    );
+  });
 
-    expect(service.getTrace("run-1").map((event) => [event.sequence, event.type])).toEqual([
-      [1, "run.started"],
-      [2, "runtime.started"],
-      [3, "tool.started"],
-      [4, "run.cancelled"],
-    ]);
-    expect((await journal.recover()).has("run-1")).toBe(false);
+  it("clears a rolled-back restore intent without recording a successful restore", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
+    temporaryDirectories.push(root);
+    const initial = await openService(root);
+    const agent = await initial.service.createAgent({ name: "Rollback Recovery" });
+    const { run } = await initial.service.sendMessage(agent.id, "establish model context");
+    await expect.poll(() => initial.service.getRun(run.id).status).toBe("completed");
+
+    const statePath = path.join(agent.workspacePath, "state.txt");
+    await writeFile(statePath, "recovered state", "utf8");
+    const resulting = await initial.recoveryStore.capture(agent.workspacePath);
+    await writeFile(statePath, "original state", "utf8");
+    const expected = await initial.recoveryStore.capture(agent.workspacePath);
+    const operationId = "00000000-0000-4000-8000-000000000102";
+
+    await initial.store.mutate((database) => {
+      const storedRun = database.runs.find((candidate) => candidate.id === run.id);
+      const storedAgent = database.agents.find((candidate) => candidate.id === agent.id);
+      if (!storedRun || !storedAgent || !storedRun.recovery.before) {
+        throw new Error("Recovery fixture was not persisted");
+      }
+      storedRun.recovery.pendingRestores.push({
+        id: operationId,
+        idempotencyKeyHash: "2".repeat(64),
+        checkpointId: storedRun.recovery.before.rootHash,
+        actorType: "owner",
+        actorId: agent.ownerUserId,
+        mode: "paths",
+        selectedPaths: ["state.txt"],
+        restoredPaths: ["state.txt"],
+        expectedRootHash: expected.rootHash,
+        resultingRootHash: resulting.rootHash,
+        startedAt: new Date(Date.now() - 1_000).toISOString(),
+      });
+      storedAgent.status = "busy";
+      storedAgent.codexThreadId = "valid-thread-before-rollback";
+    });
+
+    const restarted = await openService(root);
+    const recoveredRun = restarted.service.getRun(run.id);
+    expect(recoveredRun.recovery.pendingRestores).toEqual([]);
+    expect(recoveredRun.recovery.restores).not.toContainEqual(
+      expect.objectContaining({ id: operationId }),
+    );
+    expect(restarted.service.getAgent(agent.id)).toMatchObject({
+      status: "ready",
+      codexThreadId: "valid-thread-before-rollback",
+      lastError: null,
+    });
+    expect(await readFile(statePath, "utf8")).toBe("original state");
+    expect(restarted.service.getTrace(run.id)).toContainEqual(
+      expect.objectContaining({
+        type: "workspace.restore.blocked",
+        status: "error",
+        summary: "Interrupted workspace restore was rolled back during restart",
+      }),
+    );
   });
 
   it("atomically accepts only one concurrent run per Agent", async () => {

@@ -6,12 +6,17 @@ export type TextRedactor = (value: string) => string;
 export function createTextRedactor(
   config: Pick<
     AppConfig,
-    "arkApiKey" | "traceViewerToken" | "authToken" | "userAccounts"
+    | "arkApiKey"
+    | "traceViewerToken"
+    | "recoveryOperatorToken"
+    | "authToken"
+    | "userAccounts"
   >,
 ): TextRedactor {
   const configuredSecrets = [
     [config.arkApiKey, "[REDACTED_API_KEY]"],
     [config.traceViewerToken, "[REDACTED_TOKEN]"],
+    [config.recoveryOperatorToken, "[REDACTED_TOKEN]"],
     [config.authToken, "[REDACTED_TOKEN]"],
     ...config.userAccounts.map(
       (account) => [account.token, "[REDACTED_TOKEN]"] as const,
@@ -29,7 +34,7 @@ export function createTextRedactor(
       .replace(/\bark-[A-Za-z0-9._~-]{8,}\b/gi, "[REDACTED_API_KEY]")
       .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED_TOKEN]")
       .replace(
-        /((?:ARK_API_KEY|API[_ -]?KEY|TRACE_VIEWER_TOKEN|APP_AUTH_TOKEN|ACCESS_TOKEN|TOKEN|PASSWORD|PASSPHRASE)\s*[=:]\s*)[^\s,;]+/gi,
+        /((?:ARK_API_KEY|API[_ -]?KEY|TRACE_VIEWER_TOKEN|RECOVERY_OPERATOR_TOKEN|APP_AUTH_TOKEN|ACCESS_TOKEN|TOKEN|PASSWORD|PASSPHRASE)\s*[=:]\s*)[^\s,;]+/gi,
         "$1[REDACTED]",
       )
       .replace(

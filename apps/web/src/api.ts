@@ -4,6 +4,10 @@ import type {
   DeveloperAnalytics,
   DeveloperUserSummary,
   Message,
+  RecoveryPreview,
+  RecoverySelection,
+  RestoreOperation,
+  RunRecovery,
   SystemInfo,
   TraceEvent,
   User,
@@ -13,13 +17,16 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public readonly status: number,
+    public readonly data: unknown,
   ) {
     super(message);
+    this.name = "ApiError";
   }
 }
 
 let authToken = "";
 let traceViewerToken = "";
+let recoveryOperatorToken = "";
 
 export function setAuthToken(token: string): void {
   authToken = token.trim();
@@ -27,6 +34,10 @@ export function setAuthToken(token: string): void {
 
 export function setTraceViewerToken(token: string): void {
   traceViewerToken = token.trim();
+}
+
+export function setRecoveryOperatorToken(token: string): void {
+  recoveryOperatorToken = token.trim();
 }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -41,16 +52,17 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   });
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
   if (!response.ok) {
-    throw new ApiError(data.error ?? "Request failed", response.status);
+    throw new ApiError(data.error ?? "Request failed", response.status, data);
   }
   return data;
 }
 
 async function streamDeveloperTrace(
   id: string,
-  onMessage: (message:
-    | { type: "snapshot"; traces: TraceEvent[] }
-    | { type: "trace"; event: TraceEvent }
+  onMessage: (
+    message:
+      | { type: "snapshot"; traces: TraceEvent[] }
+      | { type: "trace"; event: TraceEvent },
   ) => void,
   signal: AbortSignal,
 ): Promise<void> {
@@ -62,18 +74,26 @@ async function streamDeveloperTrace(
   });
   if (!response.ok) {
     const data = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new ApiError(data.error ?? "Trace stream failed", response.status);
+    throw new ApiError(
+      data.error ?? "Trace stream failed",
+      response.status,
+      data,
+    );
   }
-  if (!response.body) throw new Error("Trace streaming is not supported by this browser");
+  if (!response.body) {
+    throw new Error("Trace streaming is not supported by this browser");
+  }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   const consumeLine = (line: string) => {
     if (!line.trim()) return;
-    onMessage(JSON.parse(line) as
-      | { type: "snapshot"; traces: TraceEvent[] }
-      | { type: "trace"; event: TraceEvent });
+    onMessage(
+      JSON.parse(line) as
+        | { type: "snapshot"; traces: TraceEvent[] }
+        | { type: "trace"; event: TraceEvent },
+    );
   };
 
   while (true) {
@@ -144,6 +164,85 @@ export const api = {
         ? { "X-Trace-Viewer-Token": traceViewerToken }
         : {},
     }),
+  streamDeveloperTrace,
+  developerRecovery: (id: string) =>
+    request<{ recovery: RunRecovery }>(
+      "/api/developer/runs/" + id + "/recovery",
+      {
+        headers: traceViewerToken
+          ? { "X-Trace-Viewer-Token": traceViewerToken }
+          : {},
+      },
+    ),
+  developerRecoveryPreview: (
+    id: string,
+    body: { checkpointId: string; selection: RecoverySelection },
+  ) =>
+    request<{ preview: RecoveryPreview }>(
+      "/api/developer/runs/" + id + "/recovery/preview",
+      {
+        method: "POST",
+        headers: traceViewerToken
+          ? { "X-Trace-Viewer-Token": traceViewerToken }
+          : {},
+        body: JSON.stringify(body),
+      },
+    ),
+  developerRecoveryRestore: (
+    id: string,
+    body: {
+      checkpointId: string;
+      previewId: string;
+      selection: RecoverySelection;
+    },
+    idempotencyKey: string,
+  ) =>
+    request<{ operation: RestoreOperation }>(
+      "/api/developer/runs/" + id + "/recovery/restore",
+      {
+        method: "POST",
+        headers: {
+          ...(traceViewerToken
+            ? { "X-Trace-Viewer-Token": traceViewerToken }
+            : {}),
+          ...(recoveryOperatorToken
+            ? { "X-Recovery-Operator-Token": recoveryOperatorToken }
+            : {}),
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify(body),
+      },
+    ),
+  recovery: (id: string) =>
+    request<{ recovery: RunRecovery }>("/api/runs/" + id + "/recovery"),
+  recoveryPreview: (
+    id: string,
+    body: { checkpointId: string; selection: RecoverySelection },
+  ) =>
+    request<{ preview: RecoveryPreview }>(
+      "/api/runs/" + id + "/recovery/preview",
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    ),
+  recoveryRestore: (
+    id: string,
+    body: {
+      checkpointId: string;
+      previewId: string;
+      selection: RecoverySelection;
+    },
+    idempotencyKey: string,
+  ) =>
+    request<{ operation: RestoreOperation }>(
+      "/api/runs/" + id + "/recovery/restore",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(body),
+      },
+    ),
   system: () => request<SystemInfo>("/api/system"),
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
   createAgent: (body: {
@@ -187,7 +286,6 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
-  streamDeveloperTrace,
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
   trace: (id: string) =>
     request<{ traces: TraceEvent[] }>("/api/runs/" + id + "/trace", {

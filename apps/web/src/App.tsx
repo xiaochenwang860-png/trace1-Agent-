@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken, setTraceViewerToken } from "./api";
+import { RecoveryPanel } from "./RecoveryPanel";
 import type {
   Agent,
   AgentRun,
@@ -430,7 +431,13 @@ export default function App() {
       selectedIdRef.current === agentId &&
       activeRunRef.current?.id === runId
     ) {
-      setTraces(result.traces);
+      setTraces(
+        [...result.traces].sort(
+          (left, right) =>
+            left.sequence - right.sequence ||
+            left.timestamp.localeCompare(right.timestamp),
+        ),
+      );
     }
   }, [developerView]);
 
@@ -604,7 +611,11 @@ export default function App() {
             setTraces(
               message.traces
                 .filter((event) => event.runId === runId && event.traceId === runId)
-                .sort((left, right) => left.sequence - right.sequence),
+                .sort(
+                  (left, right) =>
+                    left.sequence - right.sequence ||
+                    left.timestamp.localeCompare(right.timestamp),
+                ),
             );
             return;
           }
@@ -662,7 +673,6 @@ export default function App() {
 
         let displayedRun = current;
         if (latest && shouldFollowLatest) {
-          if (current?.id !== latest.id) setTraces([]);
           displayedRun = latest;
           followLatestRunRef.current = true;
           activeRunRef.current = latest;
@@ -676,9 +686,9 @@ export default function App() {
           }
         }
 
-        if (displayedRun && !["queued", "running"].includes(displayedRun.status)) {
+        if (displayedRun) {
           await refreshTrace(displayedRun.id, selectedId);
-        } else if (!displayedRun) {
+        } else {
           setTraces([]);
         }
         await Promise.all([
@@ -891,7 +901,6 @@ export default function App() {
     followLatestRunRef.current = run.id === latestRunIdRef.current;
     activeRunRef.current = run;
     setActiveRun(run);
-    setTraces([]);
     setTraceFilter("all");
     setExpandedTraceIds(new Set());
     setError(null);
@@ -946,7 +955,7 @@ export default function App() {
       }
       if (traceFilter === "model") return event.type.startsWith("model.");
       if (traceFilter === "tool") return event.type.startsWith("tool.");
-      return event.type === "file.changed";
+      return event.type === "file.changed" || event.type.startsWith("workspace.");
     });
   }, [traceFilter, traces]);
 
@@ -958,7 +967,11 @@ export default function App() {
     const attempts = new Map<string, TraceEvent>();
     const models = new Map<string, TraceEvent>();
     const tools = new Map<string, TraceEvent>();
-    const ordered = [...traces].sort((left, right) => left.sequence - right.sequence);
+    const ordered = [...traces].sort(
+      (left, right) =>
+        left.sequence - right.sequence ||
+        left.timestamp.localeCompare(right.timestamp),
+    );
     for (const event of ordered) {
       if (event.type === "runtime.started") runtime = event;
       if (event.type === "attempt.started") {
@@ -988,7 +1001,11 @@ export default function App() {
     }
     if (terminal) return null;
     const latest = (events: Iterable<TraceEvent>) =>
-      [...events].sort((left, right) => left.sequence - right.sequence).at(-1) ?? null;
+      [...events].sort(
+        (left, right) =>
+          left.sequence - right.sequence ||
+          left.timestamp.localeCompare(right.timestamp),
+      ).at(-1) ?? null;
     return (
       latest(tools.values()) ??
       latest(models.values()) ??
@@ -1026,7 +1043,9 @@ export default function App() {
   const traceWaterfall = useMemo(() => {
     if (traces.length === 0) return [];
     const sortedEvents = [...traces].sort(
-      (left, right) => left.sequence - right.sequence || left.timestamp.localeCompare(right.timestamp),
+      (left, right) =>
+        left.sequence - right.sequence ||
+        left.timestamp.localeCompare(right.timestamp),
     );
     const startFor = (event: TraceEvent): number => {
       const startType =
@@ -1036,12 +1055,17 @@ export default function App() {
           ? "model.requested"
           : event.type === "tool.completed" || event.type === "tool.failed"
             ? "tool.started"
+            : event.type === "workspace.restore.completed" ||
+                event.type === "workspace.restore.blocked" ||
+                event.type === "workspace.restore.failed"
+              ? "workspace.restore.started"
             : event.type === "run.completed" || event.type === "run.failed" || event.type === "run.cancelled"
               ? "run.started"
               : null;
       if (!startType) return Date.parse(event.timestamp);
       const matchingSpan = sortedEvents.find(
-        (candidate) => candidate.type === startType && candidate.spanId === event.spanId,
+        (candidate) =>
+          candidate.type === startType && candidate.spanId === event.spanId,
       );
       if (matchingSpan) return Date.parse(matchingSpan.timestamp);
       const preceding = [...sortedEvents]
@@ -1059,6 +1083,11 @@ export default function App() {
         "tool.completed",
         "tool.failed",
         "file.changed",
+        "workspace.checkpoint.created",
+        "workspace.diff.generated",
+        "workspace.restore.completed",
+        "workspace.restore.blocked",
+        "workspace.restore.failed",
         "run.completed",
         "run.failed",
         "run.cancelled",
@@ -2256,19 +2285,6 @@ export default function App() {
                       )}
                     </div>
                   </div>
-                  {currentTraceStep && (
-                    <section className="trace-live-step" aria-live="polite">
-                      <span className="trace-live-pulse" aria-hidden="true" />
-                      <div>
-                        <span className="eyebrow">Executing now</span>
-                        <strong>{currentTraceStep.summary}</strong>
-                        <code>{currentTraceStep.type}</code>
-                      </div>
-                      <span className="trace-live-duration">
-                        {formatDuration(currentTraceDuration)}
-                      </span>
-                    </section>
-                  )}
                   <div className="trace-toolbar">
                     <label>
                       Run
@@ -2317,6 +2333,19 @@ export default function App() {
                         <dd>{formatNumber(activeRun.usage.outputTokens)} tokens</dd>
                       </div>
                     </dl>
+                  )}
+                  {currentTraceStep && (
+                    <section className="trace-live-step" aria-live="polite">
+                      <span className="trace-live-pulse" aria-hidden="true" />
+                      <div>
+                        <span className="eyebrow">Executing now</span>
+                        <strong>{currentTraceStep.summary}</strong>
+                        <code>{currentTraceStep.type}</code>
+                      </div>
+                      <span className="trace-live-duration">
+                        {formatDuration(currentTraceDuration)}
+                      </span>
+                    </section>
                   )}
                   {traceWaterfall.length > 0 && (
                     <section className="trace-waterfall" aria-label="Trace timeline">
@@ -2379,6 +2408,18 @@ export default function App() {
                       </div>
                     </aside>
                   )}
+                  <RecoveryPanel
+                    key={activeRun.id}
+                    run={activeRun}
+                    accessMode="developer"
+                    onRestored={async () => {
+                      await Promise.all([
+                        refreshTrace(activeRun.id, selected.id),
+                        refreshRuns(selected.id),
+                        refreshAgents(),
+                      ]);
+                    }}
+                  />
                   {traces.length === 0 ? (
                     <p className="trace-empty">Collecting runtime evidence…</p>
                   ) : visibleTraces.length === 0 ? (
@@ -2402,6 +2443,10 @@ export default function App() {
                               <span className="trace-item-summary">
                                 <span className="trace-meta">
                                   <strong>{event.type}</strong>
+                                  <span>#{event.sequence}</span>
+                                  {event.attemptNumber && (
+                                    <span>Attempt {event.attemptNumber}</span>
+                                  )}
                                   <span>{formatTime(event.timestamp)}</span>
                                   <span>{formatDuration(event.durationMs)}</span>
                                 </span>
@@ -2440,6 +2485,59 @@ export default function App() {
                                     <dt>Duration</dt>
                                     <dd>{formatDuration(event.durationMs)}</dd>
                                   </div>
+                                  <div>
+                                    <dt>Sequence</dt>
+                                    <dd>{event.sequence}</dd>
+                                  </div>
+                                  {event.attemptNumber && (
+                                    <div>
+                                      <dt>Attempt</dt>
+                                      <dd>{event.attemptNumber}</dd>
+                                    </div>
+                                  )}
+                                  {event.errorCode && (
+                                    <div>
+                                      <dt>Error code</dt>
+                                      <dd><code>{event.errorCode}</code></dd>
+                                    </div>
+                                  )}
+                                  {event.retryable !== undefined && (
+                                    <div>
+                                      <dt>Retryable</dt>
+                                      <dd>{event.retryable ? "Yes" : "No"}</dd>
+                                    </div>
+                                  )}
+                                  {event.retryDelayMs !== undefined && (
+                                    <div>
+                                      <dt>Retry delay</dt>
+                                      <dd>{formatDuration(event.retryDelayMs)}</dd>
+                                    </div>
+                                  )}
+                                  {event.attemptId && (
+                                    <div className="trace-detail-wide">
+                                      <dt>Attempt</dt>
+                                      <dd>
+                                        #{event.attemptNumber ?? "?"} · <code>{event.attemptId}</code>
+                                      </dd>
+                                    </div>
+                                  )}
+                                  {event.retryOfAttemptId && (
+                                    <div className="trace-detail-wide">
+                                      <dt>Retry of attempt</dt>
+                                      <dd><code>{event.retryOfAttemptId}</code></dd>
+                                    </div>
+                                  )}
+                                  {event.nextAttemptId && (
+                                    <div className="trace-detail-wide">
+                                      <dt>Next attempt</dt>
+                                      <dd>
+                                        <code>{event.nextAttemptId}</code>
+                                        {event.retryDelayMs !== undefined
+                                          ? ` after ${formatDuration(event.retryDelayMs)}`
+                                          : ""}
+                                      </dd>
+                                    </div>
+                                  )}
                                   <div className="trace-detail-wide">
                                     <dt>Summary</dt>
                                     <dd>{event.summary}</dd>
@@ -2470,43 +2568,6 @@ export default function App() {
                                     <dt>Event ID</dt>
                                     <dd><code>{event.id}</code></dd>
                                   </div>
-                                  {event.attemptId && (
-                                    <div className="trace-detail-wide">
-                                      <dt>Attempt</dt>
-                                      <dd>
-                                        #{event.attemptNumber ?? "?"} · <code>{event.attemptId}</code>
-                                      </dd>
-                                    </div>
-                                  )}
-                                  {event.retryOfAttemptId && (
-                                    <div className="trace-detail-wide">
-                                      <dt>Retry of attempt</dt>
-                                      <dd><code>{event.retryOfAttemptId}</code></dd>
-                                    </div>
-                                  )}
-                                  {event.nextAttemptId && (
-                                    <div className="trace-detail-wide">
-                                      <dt>Next attempt</dt>
-                                      <dd>
-                                        <code>{event.nextAttemptId}</code>
-                                        {event.retryDelayMs !== undefined
-                                          ? ` after ${formatDuration(event.retryDelayMs)}`
-                                          : ""}
-                                      </dd>
-                                    </div>
-                                  )}
-                                  {event.errorCode && (
-                                    <div>
-                                      <dt>Error code</dt>
-                                      <dd><code>{event.errorCode}</code></dd>
-                                    </div>
-                                  )}
-                                  {event.retryable !== undefined && (
-                                    <div>
-                                      <dt>Retryable</dt>
-                                      <dd>{event.retryable ? "yes" : "no"}</dd>
-                                    </div>
-                                  )}
                                   {event.error && (
                                     <div className="trace-detail-wide trace-detail-error">
                                       <dt>Error</dt>
@@ -2574,6 +2635,20 @@ export default function App() {
                     <strong>Run failed</strong>
                     <span>{activeRun.error}</span>
                   </article>
+                )}
+                {activeRun && (
+                  <RecoveryPanel
+                    key={"owner-" + activeRun.id}
+                    run={activeRun}
+                    accessMode="owner"
+                    onRestored={async () => {
+                      await Promise.all([
+                        refreshMessages(selected.id),
+                        refreshRuns(selected.id),
+                        refreshAgents(),
+                      ]);
+                    }}
+                  />
                 )}
                 <div ref={messageEnd} />
               </div>

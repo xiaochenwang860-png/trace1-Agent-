@@ -10,6 +10,7 @@ runtime_apt_mirror="${CONTAINER_APT_MIRROR:-}"
 runtime_apt_security_mirror="${CONTAINER_APT_SECURITY_MIRROR:-}"
 runtime_apt_packages="${CONTAINER_RUNTIME_APT_PACKAGES:-ca-certificates git ripgrep}"
 codex_sandbox_mode="${CODEX_SANDBOX_MODE:-workspace-write}"
+git_bin="${GIT_BIN:-git}"
 
 log() {
   printf '[local-poc] %s\n' "$*" >&2
@@ -79,6 +80,35 @@ if (( node_major < 22 )); then
   log "Node.js 22+ is required; found $(node --version)."
   exit 2
 fi
+
+command -v "$git_bin" >/dev/null 2>&1 || {
+  log "Git 2.29+ is required by workspace recovery; $git_bin was not found."
+  exit 2
+}
+
+git_version="$("$git_bin" --version 2>/dev/null || true)"
+if [[ ! "$git_version" =~ ^git[[:space:]]version[[:space:]]([0-9]+)\.([0-9]+) ]]; then
+  log "Unable to read the Git version from $git_bin."
+  exit 2
+fi
+git_major="${BASH_REMATCH[1]}"
+git_minor="${BASH_REMATCH[2]}"
+if (( git_major < 2 || (git_major == 2 && git_minor < 29) )); then
+  log "Git 2.29+ is required; found $git_version."
+  exit 2
+fi
+
+git_probe_root="$(mktemp -d "${TMPDIR:-/tmp}/launchpad-git-probe.XXXXXX")"
+git_probe_repo="$git_probe_root/repository.git"
+if ! "$git_bin" init --bare --object-format=sha256 --quiet "$git_probe_repo" \
+  || [[ "$("$git_bin" --git-dir="$git_probe_repo" rev-parse --is-bare-repository 2>/dev/null || true)" != "true" ]] \
+  || [[ "$("$git_bin" --git-dir="$git_probe_repo" rev-parse --show-object-format=storage 2>/dev/null || true)" != "sha256" ]]; then
+  rm -rf -- "$git_probe_root"
+  log "$git_version cannot create the required SHA-256 bare repository."
+  exit 2
+fi
+rm -rf -- "$git_probe_root"
+export GIT_BIN="$git_bin"
 
 engine="$(detect_engine)"
 log "Using $engine as the Agent Runtime engine."
@@ -152,6 +182,11 @@ if [[ -z "${TRACE_VIEWER_TOKEN:-}" ]]; then
   TRACE_VIEWER_TOKEN="$(node -p 'require("node:crypto").randomBytes(18).toString("base64url")')"
   export TRACE_VIEWER_TOKEN
 fi
+if [[ -z "${RECOVERY_OPERATOR_TOKEN:-}" ]]; then
+  RECOVERY_OPERATOR_TOKEN="$(node -p 'require("node:crypto").randomBytes(24).toString("base64url")')"
+  export RECOVERY_OPERATOR_TOKEN
+fi
+export RECOVERY_OPERATOR_ID="${RECOVERY_OPERATOR_ID:-local-recovery-operator-$(id -u)}"
 export CODEX_SANDBOX_MODE="$codex_sandbox_mode"
 export RUNTIME_PROVIDER=container
 export CONTAINER_ENGINE="$engine"
@@ -180,4 +215,6 @@ npm run build
 log "Agent workspace: http://localhost:$PORT"
 log "Developer console: http://localhost:$PORT/developer"
 log "Developer console token: $TRACE_VIEWER_TOKEN"
+log "Recovery operator ID: $RECOVERY_OPERATOR_ID"
+log "Recovery operator token: $RECOVERY_OPERATOR_TOKEN"
 npm start

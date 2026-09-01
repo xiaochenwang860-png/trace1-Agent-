@@ -24,14 +24,21 @@ set -a
 source .env.production
 set +a
 
-if [[ "${ARK_API_KEY:-}" == "" || "${ARK_MODEL:-}" == "" || "${APP_AUTH_TOKEN:-}" == "" || "${TRACE_VIEWER_TOKEN:-}" == "" ]]; then
-  echo "ARK_API_KEY, ARK_MODEL, APP_AUTH_TOKEN and TRACE_VIEWER_TOKEN are required in .env.production." >&2
+if [[ "${ARK_API_KEY:-}" == "" \
+  || "${ARK_MODEL:-}" == "" \
+  || "${APP_AUTH_TOKEN:-}" == "" \
+  || "${TRACE_VIEWER_TOKEN:-}" == "" \
+  || "${RECOVERY_OPERATOR_TOKEN:-}" == "" \
+  || "${RECOVERY_OPERATOR_ID:-}" == "" ]]; then
+  echo "ARK_API_KEY, ARK_MODEL, APP_AUTH_TOKEN, TRACE_VIEWER_TOKEN, RECOVERY_OPERATOR_TOKEN and RECOVERY_OPERATOR_ID are required in .env.production." >&2
   exit 1
 fi
 
 export TF_VAR_ark_api_key="$ARK_API_KEY"
 export TF_VAR_app_auth_token="$APP_AUTH_TOKEN"
 export TF_VAR_trace_viewer_token="$TRACE_VIEWER_TOKEN"
+export TF_VAR_recovery_operator_token="$RECOVERY_OPERATOR_TOKEN"
+export TF_VAR_recovery_operator_id="$RECOVERY_OPERATOR_ID"
 export TF_VAR_ark_model="$ARK_MODEL"
 export TF_VAR_ark_base_url="${ARK_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}"
 
