@@ -46,7 +46,7 @@ Interrupted Runs become `cancelled` after a restart.
 
 ```text
 data/launchpad.json       Agent, message, and Run metadata
-data/recovery/             CAS objects, manifests, and restore journals
+data/recovery/             Per-Agent SHA-256 bare Git repositories and restore journals
 workspaces/AgentID/       Agent-created files
 workspaces/.deleted/      Archived deleted workspaces
 codex-home/               Codex configuration and sessions
@@ -56,10 +56,13 @@ codex-home/               Codex configuration and sessions
 one process only.
 
 `RecoveryStore` captures complete workspace manifests and immutable SHA-256
-blobs before and after a Run. Restore requires a conflict-checked preview,
-captures a safety snapshot, and uses a durable directory-swap journal that is
-reconciled on startup. It does not invoke or require system Git. See
-[Workspace Recovery](WORKSPACE_RECOVERY.md).
+blobs before and after a Run. In the production path those objects are stored
+in an external bare Git repository per Agent. Restore requires a
+conflict-checked preview, captures a safety snapshot, and uses a durable
+directory-swap journal that is reconciled on startup. The Agent workspace does
+not contain `.git`; the service invokes only local Git plumbing commands. See
+[Workspace Recovery](WORKSPACE_RECOVERY.md) and
+[Updated Features](UPDATED_FEATURES.md).
 
 ### Runtime providers
 

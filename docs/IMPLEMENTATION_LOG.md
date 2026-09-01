@@ -68,3 +68,6 @@ automatic discovery is not appropriate.
 
 The target directory did not contain a `.git` directory, so the integration
 was synchronized as source files rather than performed as a repository merge.
+
+For the user-facing capability matrix, full architecture diagrams, execution
+and restore flows, see [Updated Features](UPDATED_FEATURES.md).

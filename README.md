@@ -523,6 +523,7 @@ git status
 Further references:
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Updated feature documentation: Glass Box + Git recovery](docs/UPDATED_FEATURES.md)
 - [Workspace recovery](docs/WORKSPACE_RECOVERY.md)
 - [Git recovery architecture](docs/GIT_RESTORE_PLAN.md)
 - [Implementation log](docs/IMPLEMENTATION_LOG.md)
